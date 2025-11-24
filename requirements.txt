@@ -1,0 +1,2 @@
+#the following is the content of requirements.txt to sucessfully run the flask app
+Flask
