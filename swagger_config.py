@@ -1,6 +1,6 @@
 # swagger_config.py
 
 SWAGGER_SETTINGS = {
-    'title': 'Sprint 1 API',
+    'title': 'Agile API Documentation',
     'uiversion': 3
 }
