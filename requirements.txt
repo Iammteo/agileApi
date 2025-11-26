@@ -1,2 +1,10 @@
 #the following is the content of requirements.txt to sucessfully run the flask app
-Flask
+Flask>=2.3.2
+Flask-SQLAlchemy>=3.0.4
+Flask-Migrate==4.0.4
+Flask-Marshmallow==0.15.0
+marshmallow-sqlalchemy>=0.29.0
+flasgger==0.9.7.1
+marshmallow==3.20.1
+
+#pip install -r requirements.txt
