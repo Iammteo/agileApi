@@ -44,14 +44,27 @@ app.config['SWAGGER'] = SWAGGER_SETTINGS
 # Initialize Swagger
 swagger = Swagger(app)
 
+#  ADD  ERROR HANDLERS
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found", "code": 404}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error", "code": 500}), 500
+
+@app.errorhandler(400)
+def bad_request(error):
+    return jsonify({"error": "Bad request", "code": 400}), 400
 
 # -------------------------
 # Existing routes
 # -------------------------
 
+
 @app.route('/')
 def hello_world():
-    return '<p> Hello world <p>'
+    return jsonify({"message": "Hello World!"}), 200
 
 
 @app.route("/health", methods=["GET"])
@@ -105,6 +118,9 @@ def get_observation(obs_id):
     observation = OBSERVATIONS.get(obs_id)
     if not observation:
         return jsonify({"error": "Observation not found"}), 404
+    
+        payload = request.get_json() or {}
+        observation["data"] = payload
 
     return jsonify(observation), 200
 
@@ -156,7 +172,7 @@ def delete_observation(obs_id):
 
     del OBSERVATIONS[obs_id]
     # 204 No Content
-    return "", 204
+    return jsonify({"message": "Observation deleted successfully"}), 200
 
 
 if __name__ == "__main__":
