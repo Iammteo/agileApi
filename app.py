@@ -183,7 +183,17 @@ from flasgger import Swagger
 from swagger_config import SWAGGER_SETTINGS
 from docs import health_check_docs
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
+from datetime import datetime, timedelta 
+import jwt
+from functools import wraps
+
+
+SECRET_KEY = "super-secret-key"   
+
+
+
+
+
 
 # Create Flask app
 app = Flask(__name__)
@@ -462,6 +472,199 @@ def delete_observation(obs_id):
     db.session.commit()
 
     return jsonify({"message": "Observation deleted successfully"}), 200
+
+@app.route("/observations/bulk", methods=["GET"])
+def bulk_health_check():  
+    """
+    Health check for bulk operations endpoint.
+    """
+    return jsonify({"status": "bulk operations endpoint is healthy"}), 200
+
+
+@app.route("/observations/bulk", methods=["POST"])
+def bulk_create_observations():
+    """
+    Bulk create observations.
+    Accepts a JSON list of observation payloads.
+    Performs validation for each item.
+    If ANY record fails, ALL are rolled back.
+    """
+    payload = request.get_json()
+
+    if not isinstance(payload, list):
+        return jsonify({"error": "Request body must be a list"}), 400
+
+    created = []
+    errors = []
+
+    # Validate each record before committing
+    for index, item in enumerate(payload):
+        ok, msg = validate_geospatial(item)
+        if not ok:
+            errors.append({
+                "index": index,
+                "error": msg,
+                "record": item
+            })
+
+    # If any record invalid, return partial failure
+    if errors:
+        return jsonify({
+            "message": "Bulk create failed",
+            "errors": errors
+        }), 400
+
+    # If all records valid → insert them
+    try:
+        for item in payload:
+            obs = Observation(
+                latitude=item["latitude"],
+                longitude=item["longitude"],
+                data=item
+            )
+            db.session.add(obs)
+            created.append(item)
+        db.session.commit()
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Bulk create error: {str(e)}"}), 500
+
+    return jsonify({
+        "message": "Bulk create successful",
+        "count": len(created),
+        "records": created
+    }), 201
+
+
+
+@app.route("/observations/bulk", methods=["PUT"])
+def bulk_update_observations():
+    """
+    Bulk update observations.
+    Client must send a list of objects with {id, ...payload}
+    If ANY record invalid or missing, whole request fails.
+    """
+    payload = request.get_json()
+
+    if not isinstance(payload, list):
+        return jsonify({"error": "Request body must be a list"}), 400
+
+    errors = []
+
+    # Validate all before performing updates
+    for index, item in enumerate(payload):
+        obs_id = item.get("id")
+        if not obs_id:
+            errors.append({
+                "index": index,
+                "error": "id is required for update",
+                "record": item
+            })
+            continue
+
+        obs = Observation.query.get(obs_id)
+        if not obs:
+            errors.append({
+                "index": index,
+                "error": f"Observation with id {obs_id} not found",
+                "record": item
+            })
+            continue
+
+        ok, msg = validate_geospatial(item)
+        if not ok:
+            errors.append({
+                "index": index,
+                "error": msg,
+                "record": item
+            })
+
+    if errors:
+        return jsonify({
+            "message": "Bulk update failed",
+            "errors": errors
+        }), 400
+
+    # If all good → perform updates
+    try:
+        for item in payload:
+            obs = Observation.query.get(item["id"])
+            obs.data = item
+            obs.latitude = item["latitude"]
+            obs.longitude = item["longitude"]
+        db.session.commit()
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Bulk update error: {str(e)}"}), 500
+
+    return jsonify({
+        "message": "Bulk update successful",
+        "count": len(payload)
+    }), 200
+
+
+
+"""JWT Authentication endpoints would go here (Story 12)"""
+
+"""function to generate token"""
+
+def create_token(user_id):
+    payload = {
+        "user_id": user_id,
+        "exp": datetime.utcnow() + timedelta(hours=1),
+        "iat": datetime.utcnow()
+    }
+    token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    return token
+
+
+
+"""decorator to protect routes"""
+
+def jwt_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = None
+
+        # Token must be passed via Authorization header
+        if "Authorization" in request.headers:
+            token = request.headers["Authorization"].replace("Bearer ", "")
+        
+        if not token:
+            return jsonify({"error": "Missing token"}), 401
+        
+        try:
+            decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            request.user = decoded  # attach user to request
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token"}), 401
+
+        return f(*args, **kwargs)
+    return wrapper
+
+
+
+"""Login to get token"""
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json()
+
+    if not data or data.get("username") != "admin" or data.get("password") != "password":
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    token = create_token(user_id=1)
+    return jsonify({"token": token}), 200
+
+"""Protected route example"""
+
+@app.route("/observations/protected", methods=["GET"])
+@jwt_required
+def protected_route():
+    return jsonify({"message": f"Hello user {request.user['user_id']}!"})
 
 
 if __name__ == "__main__":
