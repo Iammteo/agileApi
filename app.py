@@ -1,199 +1,8 @@
-# from flask import Flask, jsonify
-# from flasgger import Swagger
-# from swagger_config import SWAGGER_SETTINGS
-# from docs import health_check_docs
-
-# # Create Flask app
-# app = Flask(__name__)
-
-# # Apply Swagger configuration
-# app.config['SWAGGER'] = SWAGGER_SETTINGS
-
-# # Initialize Swagger
-# swagger = Swagger(app)
-
-# # Define route
-# @app.route('/')
-# def hello_world():
-#     return '<p> Hello world <p>'
-
-# @app.route("/health", methods=["GET"])
-# def health_check():
-#     return jsonify({"status": "ok"}), 200
-
-# # Attach external Swagger documentation
-# health_check.__doc__ = health_check_docs
-
-# if __name__ == "__main__":
-#     app.run(debug=True)
-# from flask import Flask, jsonify, request
-# from flasgger import Swagger
-# from swagger_config import SWAGGER_SETTINGS
-# from docs import health_check_docs
-
-# # Simple in-memory "database" for Sprint 1 (Story 3)
-# OBSERVATIONS = {}
-# NEXT_ID = 1
-
-# # Create Flask app
-# app = Flask(__name__)
-
-# # Apply Swagger configuration
-# app.config['SWAGGER'] = SWAGGER_SETTINGS
-
-# # Initialize Swagger
-# swagger = Swagger(app)
-
-# #  ADD  ERROR HANDLERS
-# @app.errorhandler(404)
-# def not_found(error):
-#     return jsonify({"error": "Endpoint not found", "code": 404}), 404
-
-# @app.errorhandler(500)
-# def internal_error(error):
-#     return jsonify({"error": "Internal server error", "code": 500}), 500
-
-# @app.errorhandler(400)
-# def bad_request(error):
-#     return jsonify({"error": "Bad request", "code": 400}), 400
-
-# # -------------------------
-# # Existing routes
-# # -------------------------
-
-
-# @app.route('/')
-# def hello_world():
-#     return jsonify({"message": "Hello World!"}), 200
-
-
-# @app.route("/health", methods=["GET"])
-# def health_check():
-#     return jsonify({"status": "ok"}), 200
-
-
-# # Attach external Swagger documentation to /health
-# health_check.__doc__ = health_check_docs
-
-
-# # -------------------------
-# # Story 3: CRUD endpoints
-# # -------------------------
-
-# @app.route("/observations", methods=["GET"])
-# def list_observations():
-#     """
-#     List all observations.
-#     """
-#     # Return a list of all stored observations
-#     return jsonify(list(OBSERVATIONS.values())), 200
-
-
-# @app.route("/observations", methods=["POST"])
-# def create_observation():
-#     """
-#     Create a new observation.
-#     """
-#     global NEXT_ID
-
-#     payload = request.get_json() or {}
-
-#     # For now, we just store whatever JSON comes in under 'data'
-#     observation = {
-#         "id": NEXT_ID,
-#         "data": payload
-#     }
-#     OBSERVATIONS[NEXT_ID] = observation
-#     NEXT_ID += 1
-
-#     # 201 Created
-#     return jsonify(observation), 201
-
-
-# @app.route("/observations/<int:obs_id>", methods=["GET"])
-# def get_observation(obs_id):
-#     """
-#     Get a single observation by ID.
-#     """
-#     observation = OBSERVATIONS.get(obs_id)
-#     if not observation:
-#         return jsonify({"error": "Observation not found"}), 404
-    
-#         payload = request.get_json() or {}
-#         observation["data"] = payload
-
-#     return jsonify(observation), 200
-
-
-# @app.route("/observations/<int:obs_id>", methods=["PUT"])
-# def replace_observation(obs_id):
-#     """
-#     Replace an observation (full update).
-#     """
-#     observation = OBSERVATIONS.get(obs_id)
-#     if not observation:
-#         return jsonify({"error": "Observation not found"}), 404
-
-#     payload = request.get_json() or {}
-#     observation["data"] = payload
-
-#     return jsonify(observation), 200
-
-
-# @app.route("/observations/<int:obs_id>", methods=["PATCH"])
-# def patch_observation(obs_id):
-#     """
-#     Partially update an observation.
-#     """
-#     observation = OBSERVATIONS.get(obs_id)
-#     if not observation:
-#         return jsonify({"error": "Observation not found"}), 404
-
-#     payload = request.get_json() or {}
-
-#     # Make sure observation["data"] is a dict
-#     if not isinstance(observation["data"], dict):
-#         observation["data"] = {}
-
-#     if isinstance(payload, dict):
-#         observation["data"].update(payload)
-
-#     return jsonify(observation), 200
-
-
-# @app.route("/observations/<int:obs_id>", methods=["DELETE"])
-# def delete_observation(obs_id):
-#     """
-#     Delete an observation.
-#     """
-#     observation = OBSERVATIONS.get(obs_id)
-#     if not observation:
-#         return jsonify({"error": "Observation not found"}), 404
-
-#     del OBSERVATIONS[obs_id]
-#     # 204 No Content
-#     return jsonify({"message": "Observation deleted successfully"}), 200
-
-
-# if __name__ == "__main__":
-#     app.run(debug=True)
-
 from flask import Flask, jsonify, request
 from flasgger import Swagger
 from swagger_config import SWAGGER_SETTINGS
-from docs import health_check_docs
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime, timedelta 
-import jwt
-from functools import wraps
-
-
-SECRET_KEY = "super-secret-key"   
-
-
-
-
-
+from datetime import datetime
 
 # Create Flask app
 app = Flask(__name__)
@@ -224,7 +33,7 @@ class Observation(db.Model):
     - latitude / longitude as separate columns for easy filtering
     - 'data' as JSON so the rest of the payload is still flexible
     """
-    __tablename__ = "observations"
+    _tablename_ = "observations"
 
     id = db.Column(db.Integer, primary_key=True)
     latitude = db.Column(db.Float, nullable=False)
@@ -246,21 +55,75 @@ class Observation(db.Model):
 
 @app.errorhandler(404)
 def not_found(error):
+    """
+    Not Found
+    ---
+    tags:
+      - Errors
+    responses:
+      404:
+        description: Endpoint not found
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
+              example: Endpoint not found
+            code:
+              type: integer
+              example: 404
+    """
     return jsonify({"error": "Endpoint not found", "code": 404}), 404
 
 
 @app.errorhandler(500)
 def internal_error(error):
+    """
+    Internal Server Error
+    ---
+    tags:
+      - Errors
+    responses:
+      500:
+        description: Internal server error
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
+              example: Internal server error
+            code:
+              type: integer
+              example: 500
+    """
     return jsonify({"error": "Internal server error", "code": 500}), 500
 
 
 @app.errorhandler(400)
 def bad_request(error):
+    """
+    Bad Request
+    ---
+    tags:
+      - Errors
+    responses:
+      400:
+        description: Bad request
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
+              example: Bad request
+            code:
+              type: integer
+              example: 400
+    """
     return jsonify({"error": "Bad request", "code": 400}), 400
 
 
 # -------------------------
-# Helper: geospatial validation (US-10)
+# Helper: geospatial validation
 # -------------------------
 
 def validate_geospatial(payload):
@@ -300,35 +163,123 @@ def validate_geospatial(payload):
 
 @app.route("/")
 def hello_world():
+    """
+    Root endpoint
+    Simple greeting to verify the API is running.
+    ---
+    tags:
+      - System
+    responses:
+      200:
+        description: Greeting message
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: Hello World!
+    """
     return jsonify({"message": "Hello World!"}), 200
 
 
 @app.route("/health", methods=["GET"])
 def health_check():
+    """
+    Health check
+    A simple endpoint to verify the API is running.
+    ---
+    tags:
+      - System
+    responses:
+      200:
+        description: API is healthy
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+              example: ok
+    """
     return jsonify({"status": "ok"}), 200
 
 
-# Attach external Swagger documentation to /health
-health_check.__doc__ = health_check_docs
-
-
 # -------------------------
-# Story 3 + Story 9 + Story 10: CRUD + filtering + geospatial
+# Observations: CRUD + filtering + geospatial
 # -------------------------
 
 @app.route("/observations", methods=["GET"])
 def list_observations():
     """
-    List all observations, with optional filtering (US-09).
-    - Generic field-based filtering via query params:
-        e.g. /observations?country=UK&sensor_type=rain
-      matches keys inside observation.data.
-    - Geospatial filtering via bounding box:
-        /observations?min_lat=...&max_lat=...&min_lon=...&max_lon=...
+    List observations
+    Returns all observations, optionally filtered by generic fields and geospatial bounds.
+    ---
+    tags:
+      - Observations
+    parameters:
+      - name: min_lat
+        in: query
+        type: number
+        required: false
+        description: Minimum latitude for bounding box filter.
+      - name: max_lat
+        in: query
+        type: number
+        required: false
+        description: Maximum latitude for bounding box filter.
+      - name: min_lon
+        in: query
+        type: number
+        required: false
+        description: Minimum longitude for bounding box filter.
+      - name: max_lon
+        in: query
+        type: number
+        required: false
+        description: Maximum longitude for bounding box filter.
+      - name: id
+        in: query
+        type: integer
+        required: false
+        description: Filter by observation ID.
+      - name: any_other_field
+        in: query
+        type: string
+        required: false
+        description: >
+          Any other query parameter will be matched against
+          the corresponding key inside observation.data.
+          (e.g. /observations?country=UK&sensor_type=rain)
+    responses:
+      200:
+        description: Filtered list of observations
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+                example: 1
+              data:
+                type: object
+                example:
+                  latitude: 51.5
+                  longitude: -0.12
+                  country: "UK"
+                  sensor_type: "rain"
+      400:
+        description: Bad request
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
+            code:
+              type: integer
     """
     query = Observation.query
 
-    # --- Geospatial filters applied in SQL (US-10) ---
+    # --- Geospatial filters applied in SQL ---
     min_lat = request.args.get("min_lat", type=float)
     max_lat = request.args.get("max_lat", type=float)
     min_lon = request.args.get("min_lon", type=float)
@@ -346,7 +297,7 @@ def list_observations():
     results = query.all()
     filtered = results
 
-    # --- Generic parameter-based filters (US-09) ---
+    # --- Generic parameter-based filters ---
     ignored_keys = {"min_lat", "max_lat", "min_lon", "max_lon"}
 
     for key, value in request.args.items():
@@ -373,8 +324,54 @@ def list_observations():
 @app.route("/observations", methods=["POST"])
 def create_observation():
     """
-    Create a new observation (US-10: must include latitude/longitude).
-    The client's JSON payload is stored under 'data', with an auto-generated 'id'.
+    Create an observation
+    Creates a new observation with required latitude/longitude.
+    ---
+    tags:
+      - Observations
+    consumes:
+      - application/json
+    parameters:
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          description: Observation payload stored under data.
+          required:
+            - latitude
+            - longitude
+          properties:
+            latitude:
+              type: number
+              example: 51.5
+            longitude:
+              type: number
+              example: -0.12
+            country:
+              type: string
+              example: UK
+            sensor_type:
+              type: string
+              example: rain
+    responses:
+      201:
+        description: Observation created
+        schema:
+          type: object
+          properties:
+            id:
+              type: integer
+              example: 1
+            data:
+              type: object
+      400:
+        description: Validation error (e.g. missing or invalid latitude/longitude)
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
     """
     payload = request.get_json() or {}
 
@@ -396,7 +393,34 @@ def create_observation():
 @app.route("/observations/<int:obs_id>", methods=["GET"])
 def get_observation(obs_id):
     """
-    Get a single observation by ID.
+    Get an observation
+    Returns a single observation by ID.
+    ---
+    tags:
+      - Observations
+    parameters:
+      - name: obs_id
+        in: path
+        type: integer
+        required: true
+        description: Observation ID.
+    responses:
+      200:
+        description: Observation found
+        schema:
+          type: object
+          properties:
+            id:
+              type: integer
+            data:
+              type: object
+      404:
+        description: Observation not found
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
     """
     obs = Observation.query.get(obs_id)
     if not obs:
@@ -408,8 +432,49 @@ def get_observation(obs_id):
 @app.route("/observations/<int:obs_id>", methods=["PUT"])
 def replace_observation(obs_id):
     """
-    Replace an observation (full update).
-    The client must send a complete payload, including valid latitude/longitude.
+    Replace an observation
+    Fully replaces an observation's data by ID (PUT).
+    ---
+    tags:
+      - Observations
+    consumes:
+      - application/json
+    parameters:
+      - name: obs_id
+        in: path
+        type: integer
+        required: true
+        description: Observation ID.
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          description: New observation payload (must include valid latitude/longitude).
+          properties:
+            latitude:
+              type: number
+              example: 40.7
+            longitude:
+              type: number
+              example: -74.0
+            country:
+              type: string
+              example: US
+    responses:
+      200:
+        description: Observation updated
+        schema:
+          type: object
+          properties:
+            id:
+              type: integer
+            data:
+              type: object
+      400:
+        description: Validation error
+      404:
+        description: Observation not found
     """
     obs = Observation.query.get(obs_id)
     if not obs:
@@ -432,8 +497,41 @@ def replace_observation(obs_id):
 @app.route("/observations/<int:obs_id>", methods=["PATCH"])
 def patch_observation(obs_id):
     """
-    Partially update an observation.
-    If latitude/longitude are included, they are validated.
+    Patch an observation
+    Partially updates an observation's data by ID (PATCH).
+    ---
+    tags:
+      - Observations
+    consumes:
+      - application/json
+    parameters:
+      - name: obs_id
+        in: path
+        type: integer
+        required: true
+        description: Observation ID.
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          description: Partial payload to merge into data.
+          example:
+            country: FR
+    responses:
+      200:
+        description: Observation updated
+        schema:
+          type: object
+          properties:
+            id:
+              type: integer
+            data:
+              type: object
+      400:
+        description: Validation error
+      404:
+        description: Observation not found
     """
     obs = Observation.query.get(obs_id)
     if not obs:
@@ -462,7 +560,33 @@ def patch_observation(obs_id):
 @app.route("/observations/<int:obs_id>", methods=["DELETE"])
 def delete_observation(obs_id):
     """
-    Delete an observation.
+    Delete an observation
+    Deletes an observation by ID.
+    ---
+    tags:
+      - Observations
+    parameters:
+      - name: obs_id
+        in: path
+        type: integer
+        required: true
+        description: Observation ID.
+    responses:
+      200:
+        description: Observation deleted
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: Observation deleted successfully
+      404:
+        description: Observation not found
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
     """
     obs = Observation.query.get(obs_id)
     if not obs:
@@ -472,199 +596,6 @@ def delete_observation(obs_id):
     db.session.commit()
 
     return jsonify({"message": "Observation deleted successfully"}), 200
-
-@app.route("/observations/bulk", methods=["GET"])
-def bulk_health_check():  
-    """
-    Health check for bulk operations endpoint.
-    """
-    return jsonify({"status": "bulk operations endpoint is healthy"}), 200
-
-
-@app.route("/observations/bulk", methods=["POST"])
-def bulk_create_observations():
-    """
-    Bulk create observations.
-    Accepts a JSON list of observation payloads.
-    Performs validation for each item.
-    If ANY record fails, ALL are rolled back.
-    """
-    payload = request.get_json()
-
-    if not isinstance(payload, list):
-        return jsonify({"error": "Request body must be a list"}), 400
-
-    created = []
-    errors = []
-
-    # Validate each record before committing
-    for index, item in enumerate(payload):
-        ok, msg = validate_geospatial(item)
-        if not ok:
-            errors.append({
-                "index": index,
-                "error": msg,
-                "record": item
-            })
-
-    # If any record invalid, return partial failure
-    if errors:
-        return jsonify({
-            "message": "Bulk create failed",
-            "errors": errors
-        }), 400
-
-    # If all records valid → insert them
-    try:
-        for item in payload:
-            obs = Observation(
-                latitude=item["latitude"],
-                longitude=item["longitude"],
-                data=item
-            )
-            db.session.add(obs)
-            created.append(item)
-        db.session.commit()
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": f"Bulk create error: {str(e)}"}), 500
-
-    return jsonify({
-        "message": "Bulk create successful",
-        "count": len(created),
-        "records": created
-    }), 201
-
-
-
-@app.route("/observations/bulk", methods=["PUT"])
-def bulk_update_observations():
-    """
-    Bulk update observations.
-    Client must send a list of objects with {id, ...payload}
-    If ANY record invalid or missing, whole request fails.
-    """
-    payload = request.get_json()
-
-    if not isinstance(payload, list):
-        return jsonify({"error": "Request body must be a list"}), 400
-
-    errors = []
-
-    # Validate all before performing updates
-    for index, item in enumerate(payload):
-        obs_id = item.get("id")
-        if not obs_id:
-            errors.append({
-                "index": index,
-                "error": "id is required for update",
-                "record": item
-            })
-            continue
-
-        obs = Observation.query.get(obs_id)
-        if not obs:
-            errors.append({
-                "index": index,
-                "error": f"Observation with id {obs_id} not found",
-                "record": item
-            })
-            continue
-
-        ok, msg = validate_geospatial(item)
-        if not ok:
-            errors.append({
-                "index": index,
-                "error": msg,
-                "record": item
-            })
-
-    if errors:
-        return jsonify({
-            "message": "Bulk update failed",
-            "errors": errors
-        }), 400
-
-    # If all good → perform updates
-    try:
-        for item in payload:
-            obs = Observation.query.get(item["id"])
-            obs.data = item
-            obs.latitude = item["latitude"]
-            obs.longitude = item["longitude"]
-        db.session.commit()
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": f"Bulk update error: {str(e)}"}), 500
-
-    return jsonify({
-        "message": "Bulk update successful",
-        "count": len(payload)
-    }), 200
-
-
-
-"""JWT Authentication endpoints would go here (Story 12)"""
-
-"""function to generate token"""
-
-def create_token(user_id):
-    payload = {
-        "user_id": user_id,
-        "exp": datetime.utcnow() + timedelta(hours=1),
-        "iat": datetime.utcnow()
-    }
-    token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-    return token
-
-
-
-"""decorator to protect routes"""
-
-def jwt_required(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        token = None
-
-        # Token must be passed via Authorization header
-        if "Authorization" in request.headers:
-            token = request.headers["Authorization"].replace("Bearer ", "")
-        
-        if not token:
-            return jsonify({"error": "Missing token"}), 401
-        
-        try:
-            decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-            request.user = decoded  # attach user to request
-        except jwt.ExpiredSignatureError:
-            return jsonify({"error": "Token expired"}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({"error": "Invalid token"}), 401
-
-        return f(*args, **kwargs)
-    return wrapper
-
-
-
-"""Login to get token"""
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.get_json()
-
-    if not data or data.get("username") != "admin" or data.get("password") != "password":
-        return jsonify({"error": "Invalid credentials"}), 401
-
-    token = create_token(user_id=1)
-    return jsonify({"token": token}), 200
-
-"""Protected route example"""
-
-@app.route("/observations/protected", methods=["GET"])
-@jwt_required
-def protected_route():
-    return jsonify({"message": f"Hello user {request.user['user_id']}!"})
 
 
 if __name__ == "__main__":
