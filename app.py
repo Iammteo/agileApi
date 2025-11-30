@@ -2,6 +2,8 @@ from flask import Flask, jsonify, request
 from flasgger import Swagger
 from swagger_config import SWAGGER_SETTINGS
 from flask_sqlalchemy import SQLAlchemy
+from flask_marshmallow import Marshmallow
+from marshmallow import fields
 from datetime import datetime
 
 # ---------------------------------------------------
@@ -10,93 +12,180 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# Apply Swagger configuration
+# Swagger config from your existing file
 app.config["SWAGGER"] = SWAGGER_SETTINGS
 
-# SQLite database
+# SQLite database file
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///observations.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# Initialize extensions
 db = SQLAlchemy(app)
+ma = Marshmallow(app)
 swagger = Swagger(app)
+
+# ---------------------------------------------------
+# Allowed spectral indices (US-10 extra spec)
+# ---------------------------------------------------
+# These are the only spectral index keys we accept in spectral_indices.
+ALLOWED_SPECTRAL_INDICES = {
+    "NDVI": "Normalised Difference Vegetation Index",
+    "EVI": "Enhanced Vegetation Index",
+    "SAVI": "Soil-Adjusted Vegetation Index",
+    "NDWI": "Normalised Difference Water Index",
+    "GNDVI": "Green NDVI",
+    "NDMI": "Normalised Difference Moisture Index",
+    "NBR": "Normalised Burn Ratio",
+}
+
+
+def validate_spectral_indices_dict(spectral):
+    """
+    Validate that spectral_indices:
+    - is a dict
+    - is not empty
+    - only contains keys in ALLOWED_SPECTRAL_INDICES
+    - values are numeric (float/int)
+    Returns: (ok: bool, error_msg_or_None)
+    """
+    if not isinstance(spectral, dict):
+        return False, "spectral_indices must be a JSON object"
+
+    if not spectral:
+        return False, "spectral_indices must not be empty"
+
+    invalid_keys = [k for k in spectral.keys() if k not in ALLOWED_SPECTRAL_INDICES]
+    if invalid_keys:
+        return False, (
+            f"Invalid spectral index keys: {', '.join(invalid_keys)}. "
+            f"Allowed indices are: {', '.join(sorted(ALLOWED_SPECTRAL_INDICES.keys()))}."
+        )
+
+    # check values are numeric
+    for k, v in spectral.items():
+        try:
+            float(v)
+        except (TypeError, ValueError):
+            return False, f"spectral_indices['{k}'] must be numeric"
+
+    return True, None
 
 
 # ---------------------------------------------------
-# Database model
+# Database model (US-10 + later stories)
 # ---------------------------------------------------
 
 class Observation(db.Model):
     """
     Observation stored in the database.
 
-    - latitude / longitude as separate columns for easy filtering
-    - 'data' as JSON so the rest of the payload is flexible
-    - 'timestamp' as the observation time used for date-range filtering
-    - 'created_at' used for immutability (before current quarter = read-only)
+    Fields required for US-10:
+    - timestamp
+    - timezone
+    - coordinates (latitude, longitude)
+    - satellite_id
+    - spectral_indices (restricted list of index names)
+    - notes (required)
+
+    Extra:
+    - created_at is the record creation time (used for immutability rules)
+    - data stores the original JSON payload for flexibility
     """
     __tablename__ = "observations"
 
     id = db.Column(db.Integer, primary_key=True)
+
+    # Geospatial
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
+
+    # Time
+    timestamp = db.Column(db.DateTime, nullable=False)   # observation time (ISO 8601)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    # Other metadata
+    timezone = db.Column(db.String(64), nullable=False)
+    satellite_id = db.Column(db.String(64), nullable=False)
+    spectral_indices = db.Column(db.JSON, nullable=False)
+    notes = db.Column(db.Text, nullable=False)  # now NOT NULL (required)
+
+    # Raw payload for flexibility
     data = db.Column(db.JSON, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    timestamp = db.Column(db.DateTime, nullable=True)
 
     def to_dict(self):
-        """Return the API shape."""
+        """
+        Shape returned by the API. This guarantees timestamp is ISO 8601
+        when clients query stored data (US-10 acceptance criterion).
+        """
         return {
             "id": self.id,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "timestamp": self.timestamp.isoformat(),
+            "created_at": self.created_at.isoformat(),
+            "timezone": self.timezone,
+            "satellite_id": self.satellite_id,
+            "spectral_indices": self.spectral_indices,
+            "notes": self.notes,
             "data": self.data,
         }
 
 
 # ---------------------------------------------------
-# Helpers
+# Marshmallow schema (validation for US-10)
 # ---------------------------------------------------
 
-def validate_geospatial(payload):
+class ObservationSchema(ma.Schema):
     """
-    Ensure payload has valid latitude/longitude.
-    - Both must be present
-    - Both must be numeric
-    - latitude ∈ [-90, 90], longitude ∈ [-180, 180]
-    Mutates payload so they are stored as floats.
+    Marshmallow schema for validating request bodies and
+    serialising responses where needed.
     """
-    lat = payload.get("latitude")
-    lon = payload.get("longitude")
 
-    if lat is None or lon is None:
-        return False, "latitude and longitude are required"
+    id = fields.Int(dump_only=True)
+    latitude = fields.Float(required=True)
+    longitude = fields.Float(required=True)
 
-    try:
-        lat = float(lat)
-        lon = float(lon)
-    except (TypeError, ValueError):
-        return False, "latitude and longitude must be numeric"
+    # timestamp is required but we parse the string ourselves to support 'Z'
+    timestamp = fields.String(required=True)
+    timezone = fields.String(required=True)
 
-    if not (-90 <= lat <= 90):
-        return False, "latitude must be between -90 and 90"
+    satellite_id = fields.String(required=True)
+    # Dict of spectral indices: keys=str, values=float (but we also validate separately)
+    spectral_indices = fields.Dict(
+        keys=fields.String(),
+        values=fields.Float(),
+        required=True,
+    )
+    notes = fields.String(required=True)  # now required (no allow_none)
 
-    if not (-180 <= lon <= 180):
-        return False, "longitude must be between -180 and 180"
+    created_at = fields.DateTime(dump_only=True)
+    data = fields.Dict(dump_only=True)
 
-    payload["latitude"] = lat
-    payload["longitude"] = lon
-    return True, ""
 
+observation_schema = ObservationSchema()
+observations_schema = ObservationSchema(many=True)
+
+
+# ---------------------------------------------------
+# Helper functions
+# ---------------------------------------------------
 
 def parse_timestamp(ts_str):
     """
     Parse an ISO 8601 timestamp string into a datetime.
-    Accepts e.g. '2025-01-10T12:00:00Z' or '2025-01-10T12:00:00+00:00'.
-    Returns (datetime_or_None, error_message_or_None).
+
+    Accepts:
+    - '2025-01-10T12:00:00Z'
+    - '2025-01-10T12:00:00+00:00'
+    - '2025-01-10T12:00:00' (no timezone, treated as naive UTC)
+
+    Returns: (datetime_or_None, error_message_or_None)
     """
     if not ts_str:
-        return None, None
+        return None, "timestamp is required"
 
     cleaned = str(ts_str).strip()
+
+    # Support trailing 'Z'
     if cleaned.endswith("Z"):
         cleaned = cleaned.replace("Z", "+00:00")
 
@@ -104,18 +193,22 @@ def parse_timestamp(ts_str):
         dt = datetime.fromisoformat(cleaned)
         return dt, None
     except ValueError:
-        return None, "Invalid timestamp format. Use ISO 8601 (e.g. 2025-01-10T12:00:00Z)."
+        return None, (
+            "Invalid timestamp format. Use ISO 8601 "
+            "(e.g. 2025-01-10T12:00:00Z)."
+        )
 
 
 def parse_date_param(date_str):
     """
-    Parse a query date parameter into a date.
+    Parse a query date parameter into a date for US-09 date range filtering.
+
     Accepts:
     - 'YYYY-MM-DD'
-    - Full ISO datetime like '2025-01-31T23:59:59Z' or '2025-01-31T23:59:59+00:00'
+    - or full ISO datetime like '2025-01-31T23:59:59Z'
+    - or '2025-01-31T23:59:59+00:00'
 
-    Returns:
-      (date_or_None, error_message_or_None)
+    Returns: (date_or_None, error_message_or_None)
     """
     if not date_str:
         return None, None
@@ -139,19 +232,21 @@ def parse_date_param(date_str):
     except ValueError:
         pass
 
-    # Try first 10 chars as YYYY-MM-DD
+    # Try just the first 10 chars as YYYY-MM-DD
     core = cleaned[:10]
     try:
         d = datetime.strptime(core, "%Y-%m-%d").date()
         return d, None
     except ValueError:
-        return None, "Invalid date format. Use ISO 8601 (e.g. 2025-01-31 or 2025-01-31T23:59:59Z)."
+        return None, (
+            "Invalid date format. Use ISO 8601 "
+            "(e.g. 2025-01-31 or 2025-01-31T23:59:59Z)."
+        )
 
 
 def get_observation_date(obs):
     """
-    Get the date used for filtering from the Observation.timestamp column.
-    Returns a date object or None if not set.
+    Extract date part of the observation timestamp (for date-range filtering).
     """
     if obs.timestamp is None:
         return None
@@ -160,7 +255,8 @@ def get_observation_date(obs):
 
 def get_current_quarter_start():
     """
-    Start of current quarter (UTC, naive).
+    Start of current quarter (UTC, naive datetime).
+
     Q1: Jan–Mar, Q2: Apr–Jun, Q3: Jul–Sep, Q4: Oct–Dec.
     """
     now = datetime.utcnow()
@@ -183,9 +279,57 @@ def is_before_current_quarter(dt):
 def record_is_immutable(obs):
     """
     Business rule for immutability:
-    A record is immutable if its created_at is before the current quarter.
+    A record is immutable if created before the current quarter.
+    (Used by later user stories – left intact.)
     """
     return is_before_current_quarter(obs.created_at)
+
+
+def build_observation_from_payload(payload):
+    """
+    Central helper used by POST/PUT for single records.
+
+    - Validates required fields with Marshmallow.
+    - Validates spectral_indices allowed keys.
+    - Parses ISO 8601 timestamp.
+    - Returns (Observation_instance_or_None, errors_or_None).
+    """
+    errors = observation_schema.validate(payload)
+    if errors:
+        return None, errors
+
+    # Parse timestamp
+    ts_dt, ts_err = parse_timestamp(payload.get("timestamp"))
+    if ts_err:
+        return None, {"timestamp": [ts_err]}
+
+    # Spectral indices validation (allowed names + numeric values)
+    spectral = payload.get("spectral_indices")
+    ok, msg = validate_spectral_indices_dict(spectral)
+    if not ok:
+        return None, {"spectral_indices": [msg]}
+
+    # Latitude / longitude numeric
+    try:
+        lat = float(payload["latitude"])
+        lon = float(payload["longitude"])
+    except (TypeError, ValueError):
+        return None, {
+            "latitude": ["must be numeric"],
+            "longitude": ["must be numeric"],
+        }
+
+    obs = Observation(
+        latitude=lat,
+        longitude=lon,
+        timestamp=ts_dt,
+        timezone=payload["timezone"],
+        satellite_id=payload["satellite_id"],
+        spectral_indices=spectral,
+        notes=payload["notes"],
+        data=payload,
+    )
+    return obs, None
 
 
 # ---------------------------------------------------
@@ -216,35 +360,40 @@ def method_not_allowed(error):
 
 
 # ---------------------------------------------------
-# Basic routes
+# Basic routes (left simple – other user stories)
 # ---------------------------------------------------
 
-@app.route("/")
-def hello_world():
-    return jsonify({"message": "Hello World!"}), 200
+@app.get("/")
+def root():
+    return jsonify({"message": "API is running"}), 200
 
 
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health_check():
     return jsonify({"status": "ok"}), 200
 
 
 # ---------------------------------------------------
-# Observations: CRUD + filtering + bulk
+# US-09 + US-10 + later: /api/observations
 # ---------------------------------------------------
 
-@app.route("/observations", methods=["GET"])
+@app.get("/api/observations")
 def list_observations():
     """
-    GET /observations
+    GET /api/observations
+
     Supports:
-    - Geospatial filters: min_lat, max_lat, min_lon, max_lon
-    - Date range filters: start_date, end_date (based on Observation.timestamp)
-    - Generic field filters on data: e.g. country=UK, sensor=temperature
+    - Geospatial filters (US-09):
+        min_lat, max_lat, min_lon, max_lon
+    - Date range filters (US-09):
+        start_date, end_date (based on timestamp)
+    - Generic field filters (US-09):
+        e.g. ?timezone=UTC&satellite_id=SAT-001
+        -> matched against the JSON `data` payload.
     """
     query = Observation.query
 
-    # --- Geospatial filters in SQL ---
+    # -------- Geospatial filters (location filter for US-09) --------
     min_lat = request.args.get("min_lat", type=float)
     max_lat = request.args.get("max_lat", type=float)
     min_lon = request.args.get("min_lon", type=float)
@@ -262,17 +411,17 @@ def list_observations():
     results = query.all()
     filtered = results
 
-    # --- Date range filters based on Observation.timestamp ---
+    # -------- Date range filters (US-09) --------
     start_date_str = request.args.get("start_date")
     end_date_str = request.args.get("end_date")
 
     start_date, err = parse_date_param(start_date_str)
     if err:
-        return jsonify({"error": f"Invalid start_date format. {err}", "code": 400}), 400
+        return jsonify({"error": f"Invalid start_date. {err}", "code": 400}), 400
 
     end_date, err = parse_date_param(end_date_str)
     if err:
-        return jsonify({"error": f"Invalid end_date format. {err}", "code": 400}), 400
+        return jsonify({"error": f"Invalid end_date. {err}", "code": 400}), 400
 
     if start_date or end_date:
         date_filtered = []
@@ -287,7 +436,7 @@ def list_observations():
             date_filtered.append(o)
         filtered = date_filtered
 
-    # --- Generic filters on data + id ---
+    # -------- Generic parameter-based filters (US-09) --------
     ignored_keys = {
         "min_lat", "max_lat", "min_lon", "max_lon",
         "start_date", "end_date"
@@ -297,6 +446,7 @@ def list_observations():
         if key in ignored_keys:
             continue
 
+        # Filter by id if requested: /api/observations?id=3
         if key == "id":
             try:
                 wanted_id = int(value)
@@ -314,16 +464,22 @@ def list_observations():
     return jsonify([o.to_dict() for o in filtered]), 200
 
 
-@app.route("/observations", methods=["POST"])
+@app.post("/api/observations")
 def create_observation():
     """
-    POST /observations
+    POST /api/observations
+
     - If body is a JSON object → create a single observation.
     - If body is a JSON array  → bulk create.
+
+    US-10:
+    - Given valid JSON payload (required fields present), when submitted, data persists.
+    - Given missing required fields, when submitted, API returns 400.
+    - Given stored data, when queried, timestamp follows ISO 8601 (via to_dict()).
     """
     payload = request.get_json()
 
-    # ---------- CASE 1: BULK (LIST) ----------
+    # ---------- Bulk create (list) ----------
     if isinstance(payload, list):
         if not payload:
             return jsonify({"error": "Request body is an empty list"}), 400
@@ -333,29 +489,14 @@ def create_observation():
 
         for idx, item in enumerate(payload):
             if not isinstance(item, dict):
-                errors.append({
-                    "index": idx,
-                    "error": "Item is not a JSON object"
-                })
+                errors.append({"index": idx, "error": "Item is not a JSON object"})
                 continue
 
-            ok, msg = validate_geospatial(item)
-            if not ok:
-                errors.append({"index": idx, "error": msg})
-                continue
-
-            ts_str = item.get("timestamp")
-            obs_timestamp, err = parse_timestamp(ts_str)
+            obs, err = build_observation_from_payload(item)
             if err:
-                errors.append({"index": idx, "error": err})
+                errors.append({"index": idx, "errors": err})
                 continue
 
-            obs = Observation(
-                latitude=item["latitude"],
-                longitude=item["longitude"],
-                data=item,
-                timestamp=obs_timestamp,
-            )
             db.session.add(obs)
             db.session.flush()
             created.append(obs.to_dict())
@@ -383,31 +524,19 @@ def create_observation():
             "errors": []
         }), 201
 
-    # ---------- CASE 2: SINGLE OBJECT ----------
+    # ---------- Single create (object) ----------
     payload = payload or {}
 
-    ok, msg = validate_geospatial(payload)
-    if not ok:
-        return jsonify({"error": msg}), 400
-
-    ts_str = payload.get("timestamp")
-    obs_timestamp, err = parse_timestamp(ts_str)
+    obs, err = build_observation_from_payload(payload)
     if err:
-        return jsonify({"error": err}), 400
+        return jsonify({"errors": err}), 400
 
-    obs = Observation(
-        latitude=payload["latitude"],
-        longitude=payload["longitude"],
-        data=payload,
-        timestamp=obs_timestamp,
-    )
     db.session.add(obs)
     db.session.commit()
-
     return jsonify(obs.to_dict()), 201
 
 
-@app.route("/observations/<int:obs_id>", methods=["GET"])
+@app.get("/api/observations/<int:obs_id>")
 def get_observation(obs_id):
     obs = Observation.query.get(obs_id)
     if not obs:
@@ -415,98 +544,7 @@ def get_observation(obs_id):
     return jsonify(obs.to_dict()), 200
 
 
-@app.route("/observations/<int:obs_id>", methods=["PUT"])
-def replace_observation(obs_id):
-    """
-    Full update (PUT) – record must be mutable and payload must be valid.
-    """
-    obs = Observation.query.get(obs_id)
-    if not obs:
-        return jsonify({"error": "Observation not found"}), 404
-
-    # Immutability check
-    if record_is_immutable(obs):
-        return jsonify({
-            "error": "IMMUTABLE_RECORD",
-            "message": "This observation was created before the current quarter and cannot be edited."
-        }), 403
-
-    payload = request.get_json() or {}
-
-    ok, msg = validate_geospatial(payload)
-    if not ok:
-        return jsonify({"error": msg}), 400
-
-    ts_str = payload.get("timestamp")
-    obs_timestamp, err = parse_timestamp(ts_str)
-    if err:
-        return jsonify({"error": err}), 400
-
-    obs.data = payload
-    obs.latitude = payload["latitude"]
-    obs.longitude = payload["longitude"]
-    obs.timestamp = obs_timestamp
-
-    db.session.commit()
-    return jsonify(obs.to_dict()), 200
-
-
-@app.route("/observations/<int:obs_id>", methods=["PATCH"])
-def patch_observation(obs_id):
-    """
-    Partial update (PATCH) for a single observation.
-    - Must send a JSON object (not a list).
-    - Record must be mutable (current quarter).
-    """
-    obs = Observation.query.get(obs_id)
-    if not obs:
-        return jsonify({"error": "Observation not found"}), 404
-
-    # Immutability check
-    if record_is_immutable(obs):
-        return jsonify({
-            "error": "IMMUTABLE_RECORD",
-            "message": "This observation was created before the current quarter and cannot be edited."
-        }), 403
-
-    payload = request.get_json()
-
-    # Guard against list / wrong type
-    if not isinstance(payload, dict):
-        return jsonify({
-            "error": "INVALID_PAYLOAD",
-            "message": "Request body for /observations/<id> PATCH must be a JSON object. "
-                       "For bulk updates, use /observations/bulk with a JSON array."
-        }), 400
-
-    if not isinstance(obs.data, dict):
-        obs.data = {}
-
-    merged = {**obs.data, **payload}
-
-    # Validate lat/lon if changed
-    if "latitude" in payload or "longitude" in payload:
-        ok, msg = validate_geospatial(merged)
-        if not ok:
-            return jsonify({"error": msg}), 400
-
-    # Handle timestamp if present
-    if "timestamp" in merged:
-        obs_timestamp, err = parse_timestamp(merged.get("timestamp"))
-        if err:
-            return jsonify({"error": err}), 400
-        obs.timestamp = obs_timestamp
-
-    obs.data = merged
-    # merged should always contain latitude/longitude from original or patch
-    obs.latitude = merged["latitude"]
-    obs.longitude = merged["longitude"]
-
-    db.session.commit()
-    return jsonify(obs.to_dict()), 200
-
-
-@app.route("/observations/<int:obs_id>", methods=["DELETE"])
+@app.route("/api/observations/<int:obs_id>", methods=["DELETE"])
 def delete_observation(obs_id):
     obs = Observation.query.get(obs_id)
     if not obs:
@@ -517,99 +555,8 @@ def delete_observation(obs_id):
 
     return jsonify({"message": "Observation deleted successfully"}), 200
 
-
-@app.route("/observations/bulk", methods=["PATCH"])
-def bulk_update_observations():
-    """
-    Bulk PATCH update.
-    Body: JSON array of objects with at least 'id' per item.
-    Applies immutability rules per record.
-    """
-    payload = request.get_json()
-
-    if not isinstance(payload, list) or not payload:
-        return jsonify({"error": "Request body must be a non-empty JSON array"}), 400
-
-    updated = []
-    errors = []
-
-    for idx, item in enumerate(payload):
-        if not isinstance(item, dict):
-            errors.append({"index": idx, "error": "Item is not a JSON object"})
-            continue
-
-        obs_id = item.get("id")
-        if obs_id is None:
-            errors.append({"index": idx, "error": "Missing 'id' field"})
-            continue
-
-        obs = Observation.query.get(obs_id)
-        if not obs:
-            errors.append({"index": idx, "error": f"Observation with id {obs_id} not found"})
-            continue
-
-        # Immutability check per record
-        if record_is_immutable(obs):
-            errors.append({
-                "index": idx,
-                "error": f"Observation with id {obs_id} is immutable (created before current quarter)"
-            })
-            continue
-
-        if not isinstance(obs.data, dict):
-            obs.data = {}
-
-        merged = {**obs.data, **item}
-
-        # Validate geospatial if changed
-        if "latitude" in item or "longitude" in item:
-            ok, msg = validate_geospatial(merged)
-            if not ok:
-                errors.append({"index": idx, "error": msg})
-                continue
-
-        # Validate timestamp if changed
-        if "timestamp" in item:
-            obs_timestamp, err = parse_timestamp(merged.get("timestamp"))
-            if err:
-                errors.append({"index": idx, "error": err})
-                continue
-            obs.timestamp = obs_timestamp
-
-        obs.data = merged
-        obs.latitude = merged["latitude"]
-        obs.longitude = merged["longitude"]
-
-        db.session.add(obs)
-        db.session.flush()
-        updated.append(obs.to_dict())
-
-    if updated:
-        db.session.commit()
-
-    if not updated and errors:
-        return jsonify({
-            "message": "No records updated",
-            "updated": [],
-            "errors": errors
-        }), 400
-
-    if updated and errors:
-        return jsonify({
-            "message": "Some records updated, some failed",
-            "updated": updated,
-            "errors": errors
-        }), 207
-
-    return jsonify({
-        "message": "All records updated successfully",
-        "updated": updated,
-        "errors": []
-    }), 200
-
-
 # ---------------------------------------------------
-# Entry point
+# Entrypoint
 # ---------------------------------------------------
 
 if __name__ == "__main__":
