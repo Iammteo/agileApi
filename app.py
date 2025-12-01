@@ -1,254 +1,434 @@
-from flask import Flask, jsonify, request
-from flasgger import Swagger
-from swagger_config import SWAGGER_SETTINGS
+import os
+import json
+from datetime import datetime, timezone, timedelta
+from functools import wraps
+
+from flask import Flask, request, jsonify, g, current_app
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
+import jwt
 
-# ---------------------------------------------------
-# App + Swagger + Database setup
-# ---------------------------------------------------
+db = SQLAlchemy()
 
-app = Flask(__name__)
-
-# Apply Swagger configuration
-app.config["SWAGGER"] = SWAGGER_SETTINGS
-
-# SQLite database
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///observations.db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-# Initialize extensions
-db = SQLAlchemy(app)
-swagger = Swagger(app)
-
-
-# ---------------------------------------------------
-# Database model
-# ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
 class Observation(db.Model):
-    """
-    Observation stored in the database.
-
-    - latitude / longitude as separate columns for easy filtering
-    - 'data' as JSON so the rest of the payload is flexible
-    - 'timestamp' as the observation time used for date-range filtering
-    - 'created_at' used for immutability (before current quarter = read-only)
-    """
     __tablename__ = "observations"
 
     id = db.Column(db.Integer, primary_key=True)
+    timestamp = db.Column(db.DateTime, nullable=False)
+    timezone = db.Column(db.String(64), nullable=False)
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
-    data = db.Column(db.JSON, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    timestamp = db.Column(db.DateTime, nullable=True)
-
-    def to_dict(self):
-        """Return the API shape."""
-        return {
-            "id": self.id,
-            "data": self.data,
-        }
+    satellite_id = db.Column(db.String(64), nullable=False)
+    spectral_indices = db.Column(db.Text, nullable=True)
+    notes = db.Column(db.Text, nullable=True)
 
 
-# ---------------------------------------------------
-# Helpers
-# ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
-def validate_geospatial(payload):
-    """
-    Ensure payload has valid latitude/longitude.
-    - Both must be present
-    - Both must be numeric
-    - latitude ∈ [-90, 90], longitude ∈ [-180, 180]
-    Mutates payload so they are stored as floats.
-    """
-    lat = payload.get("latitude")
-    lon = payload.get("longitude")
-
-    if lat is None or lon is None:
-        return False, "latitude and longitude are required"
-
-    try:
-        lat = float(lat)
-        lon = float(lon)
-    except (TypeError, ValueError):
-        return False, "latitude and longitude must be numeric"
-
-    if not (-90 <= lat <= 90):
-        return False, "latitude must be between -90 and 90"
-
-    if not (-180 <= lon <= 180):
-        return False, "longitude must be between -180 and 180"
-
-    payload["latitude"] = lat
-    payload["longitude"] = lon
-    return True, ""
+REQUIRED_FIELDS = ["timestamp", "timezone", "latitude", "longitude", "satellite_id"]
 
 
-def parse_timestamp(ts_str):
-    """
-    Parse an ISO 8601 timestamp string into a datetime.
-    Accepts e.g. '2025-01-10T12:00:00Z' or '2025-01-10T12:00:00+00:00'.
-    Returns (datetime_or_None, error_message_or_None).
-    """
-    if not ts_str:
-        return None, None
+def parse_iso8601(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("Timestamp must be a string")
 
-    cleaned = str(ts_str).strip()
-    if cleaned.endswith("Z"):
-        cleaned = cleaned.replace("Z", "+00:00")
+    # Handle trailing Z for UTC
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
 
-    try:
-        dt = datetime.fromisoformat(cleaned)
-        return dt, None
-    except ValueError:
-        return None, "Invalid timestamp format. Use ISO 8601 (e.g. 2025-01-10T12:00:00Z)."
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 
-def parse_date_param(date_str):
-    """
-    Parse a query date parameter into a date.
-    Accepts:
-    - 'YYYY-MM-DD'
-    - Full ISO datetime like '2025-01-31T23:59:59Z' or '2025-01-31T23:59:59+00:00'
+def format_iso8601(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    # Use Z for UTC
+    return dt.isoformat().replace("+00:00", "Z")
 
-    Returns:
-      (date_or_None, error_message_or_None)
-    """
-    if not date_str:
-        return None, None
 
-    cleaned = str(date_str).strip()
+def get_current_quarter_start() -> datetime:
+    now = datetime.now(timezone.utc)
+    quarter = ((now.month - 1) // 3) + 1
+    start_month = 3 * (quarter - 1) + 1
+    return datetime(now.year, start_month, 1, tzinfo=timezone.utc)
 
-    # Strip accidental surrounding quotes
-    if (cleaned.startswith('"') and cleaned.endswith('"')) or (
-        cleaned.startswith("'") and cleaned.endswith("'")
-    ):
-        cleaned = cleaned[1:-1].strip()
 
-    iso_candidate = cleaned
-    if iso_candidate.endswith("Z"):
-        iso_candidate = iso_candidate.replace("Z", "+00:00")
+def is_historical_record(obs: Observation) -> bool:
+    # Any record whose timestamp is before the start of the current quarter is "historical"
+    q_start = get_current_quarter_start()
+    return obs.timestamp < q_start
 
-    # Try full ISO datetime / date
-    try:
-        dt = datetime.fromisoformat(iso_candidate)
-        return dt.date(), None
-    except ValueError:
+
+def observation_to_dict(obs: Observation) -> dict:
+    return {
+        "id": obs.id,
+        "timestamp": format_iso8601(obs.timestamp),
+        "timezone": obs.timezone,
+        "latitude": obs.latitude,
+        "longitude": obs.longitude,
+        "satellite_id": obs.satellite_id,
+        "spectral_indices": json.loads(obs.spectral_indices) if obs.spectral_indices else None,
+        "notes": obs.notes,
+    }
+
+
+def validate_observation_payload(data, partial: bool = False):
+    if not isinstance(data, dict):
+        return None, ("INVALID_PAYLOAD", "Request body must be a JSON object.")
+
+    errors = []
+
+    if not partial:
+        for field in REQUIRED_FIELDS:
+            if field not in data:
+                errors.append(f"Missing required field: {field}")
+
+    # Timestamp
+    ts = None
+    if "timestamp" in data:
+        try:
+            ts = parse_iso8601(data["timestamp"])
+        except Exception:
+            errors.append("Invalid 'timestamp'. Must be ISO 8601 string.")
+    elif not partial:
+        # already counted as missing
         pass
 
-    # Try first 10 chars as YYYY-MM-DD
-    core = cleaned[:10]
-    try:
-        d = datetime.strptime(core, "%Y-%m-%d").date()
-        return d, None
-    except ValueError:
-        return None, "Invalid date format. Use ISO 8601 (e.g. 2025-01-31 or 2025-01-31T23:59:59Z)."
+    # Timezone
+    tz = None
+    if "timezone" in data:
+        tz = data["timezone"]
+        if not isinstance(tz, str) or not tz:
+            errors.append("Invalid 'timezone'. Must be non-empty string.")
+
+    # Latitude / Longitude
+    lat = None
+    if "latitude" in data:
+        try:
+            lat = float(data["latitude"])
+        except Exception:
+            errors.append("Invalid 'latitude'. Must be a number.")
+
+    lon = None
+    if "longitude" in data:
+        try:
+            lon = float(data["longitude"])
+        except Exception:
+            errors.append("Invalid 'longitude'. Must be a number.")
+
+    # Satellite ID
+    sat_id = None
+    if "satellite_id" in data:
+        sat_id = data["satellite_id"]
+        if not isinstance(sat_id, str) or not sat_id:
+            errors.append("Invalid 'satellite_id'. Must be non-empty string.")
+
+    # Spectral indices (optional, should be JSON-serialisable)
+    spectral_indices_json = None
+    if "spectral_indices" in data and data["spectral_indices"] is not None:
+        try:
+            spectral_indices_json = json.dumps(data["spectral_indices"])
+        except (TypeError, ValueError):
+            errors.append("Invalid 'spectral_indices'. Must be JSON-serialisable.")
+
+    # Notes (optional)
+    notes = None
+    if "notes" in data and data["notes"] is not None:
+        notes = str(data["notes"])
+
+    if errors:
+        return None, ("VALIDATION_ERROR", "; ".join(errors))
+
+    # Return normalised fields dict; for partial updates fields may be None / missing
+    normalised = {}
+    if ts is not None or (not partial and "timestamp" in data):
+        normalised["timestamp"] = ts
+    if tz is not None or (not partial and "timezone" in data):
+        normalised["timezone"] = tz
+    if lat is not None or (not partial and "latitude" in data):
+        normalised["latitude"] = lat
+    if lon is not None or (not partial and "longitude" in data):
+        normalised["longitude"] = lon
+    if sat_id is not None or (not partial and "satellite_id" in data):
+        normalised["satellite_id"] = sat_id
+    if "spectral_indices" in data:
+        normalised["spectral_indices"] = spectral_indices_json
+    if "notes" in data:
+        normalised["notes"] = notes
+
+    return normalised, None
 
 
-def get_observation_date(obs):
-    """
-    Get the date used for filtering from the Observation.timestamp column.
-    Returns a date object or None if not set.
-    """
-    if obs.timestamp is None:
-        return None
-    return obs.timestamp.date()
+# ---------------------------------------------------------------------------
+# Auth helpers (simple JWT)
+# ---------------------------------------------------------------------------
+
+def jwt_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify(
+                {"error": "UNAUTHENTICATED", "message": "Missing Bearer token."}
+            ), 401
+
+        token = auth_header.split(" ", 1)[1].strip()
+        secret = current_app.config["JWT_SECRET_KEY"]
+        try:
+            payload = jwt.decode(token, secret, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return jsonify(
+                {"error": "UNAUTHENTICATED", "message": "Token has expired."}
+            ), 401
+        except jwt.InvalidTokenError:
+            return jsonify(
+                {"error": "UNAUTHENTICATED", "message": "Invalid token."}
+            ), 401
+
+        g.current_user = payload.get("sub")
+        return fn(*args, **kwargs)
+
+    return wrapper
 
 
-def get_current_quarter_start():
-    """
-    Start of current quarter (UTC, naive).
-    Q1: Jan–Mar, Q2: Apr–Jun, Q3: Jul–Sep, Q4: Oct–Dec.
-    """
-    now = datetime.utcnow()
-    current_q = ((now.month - 1) // 3) + 1
-    start_month = (current_q - 1) * 3 + 1
-    return datetime(now.year, start_month, 1)
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
+
+def create_app():
+    app = Flask(__name__)
+
+    # Basic config
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
+        "DATABASE_URL", "sqlite:///observations.db"
+    )
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
+    app.config["PROPAGATE_EXCEPTIONS"] = True
+
+    db.init_app(app)
+
+    with app.app_context():
+        db.create_all()
+
+    register_error_handlers(app)
+    register_routes(app)
+
+    return app
 
 
-def is_before_current_quarter(dt):
-    """
-    True if given datetime is before start of current quarter.
-    If dt is None, treat as 'old' to be safe.
-    """
-    if dt is None:
-        return True
-    quarter_start = get_current_quarter_start()
-    return dt < quarter_start
+# ---------------------------------------------------------------------------
+# Error handlers (JSON only)
+# ---------------------------------------------------------------------------
+
+def register_error_handlers(app: Flask):
+    @app.errorhandler(400)
+    def handle_400(err):
+        return jsonify(
+            {"error": "BAD_REQUEST", "message": getattr(err, "description", "Bad request.")}
+        ), 400
+
+    @app.errorhandler(401)
+    def handle_401(err):
+        return jsonify(
+            {"error": "UNAUTHENTICATED", "message": getattr(err, "description", "Unauthenticated.")}
+        ), 401
+
+    @app.errorhandler(403)
+    def handle_403(err):
+        return jsonify(
+            {"error": "FORBIDDEN", "message": getattr(err, "description", "Forbidden.")}
+        ), 403
+
+    @app.errorhandler(404)
+    def handle_404(err):
+        return jsonify(
+            {"error": "NOT_FOUND", "message": getattr(err, "description", "Not found.")}
+        ), 404
+
+    @app.errorhandler(405)
+    def handle_405(err):
+        return jsonify(
+            {"error": "METHOD_NOT_ALLOWED", "message": "Method not allowed."}
+        ), 405
+
+    @app.errorhandler(500)
+    def handle_500(err):
+        return jsonify(
+            {"error": "INTERNAL_SERVER_ERROR", "message": "An unexpected error occurred."}
+        ), 500
 
 
-def record_is_immutable(obs):
-    """
-    Business rule for immutability:
-    A record is immutable if its created_at is before the current quarter.
-    """
-    return is_before_current_quarter(obs.created_at)
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+def register_routes(app: Flask):
+    # Health check (no auth)
+    @app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({"status": "ok"}), 200
+
+    # Simple login to get JWT (demo only)
+    @app.route("/auth/login", methods=["POST"])
+    def login():
+        if not request.is_json:
+            return jsonify(
+                {"error": "INVALID_PAYLOAD", "message": "Request body must be JSON."}
+            ), 400
+        data = request.get_json(silent=True) or {}
+        username = data.get("username")
+        password = data.get("password")
+
+        # In a real system, verify against a user store.
+        valid_username = os.getenv("API_USERNAME", "admin")
+        valid_password = os.getenv("API_PASSWORD", "password")
+
+        if username != valid_username or password != valid_password:
+            return jsonify(
+                {"error": "UNAUTHENTICATED", "message": "Invalid credentials."}
+            ), 401
+
+        payload = {
+            "sub": username,
+            "iat": datetime.now(timezone.utc),
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+        }
+        token = jwt.encode(payload, app.config["JWT_SECRET_KEY"], algorithm="HS256")
+        return jsonify({"access_token": token}), 200
+
+    # CRUD for observations
+    @app.route("/api/observations", methods=["GET", "POST"])
+    @jwt_required
+    def observations_collection():
+        if request.method == "GET":
+            return handle_observations_list()
+        elif request.method == "POST":
+            return handle_observation_create()
+
+    @app.route("/api/observations/<int:obs_id>", methods=["GET", "PUT", "PATCH", "DELETE"])
+    @jwt_required
+    def observation_item(obs_id):
+        if request.method == "GET":
+            return handle_observation_get(obs_id)
+        elif request.method == "PUT":
+            return handle_observation_put(obs_id)
+        elif request.method == "PATCH":
+            return handle_observation_patch(obs_id)
+        elif request.method == "DELETE":
+            return handle_observation_delete(obs_id)
+
+    # Bulk operations
+    @app.route("/api/observations/bulk", methods=["POST", "PATCH"])
+    @jwt_required
+    def observations_bulk():
+        if not request.is_json:
+            return jsonify(
+                {"error": "INVALID_PAYLOAD", "message": "Request body must be JSON."}
+            ), 400
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, list):
+            return jsonify(
+                {
+                    "error": "INVALID_PAYLOAD",
+                    "message": "Bulk operations require a JSON array of records.",
+                }
+            ), 400
+
+        if request.method == "POST":
+            return handle_bulk_create(payload)
+        elif request.method == "PATCH":
+            return handle_bulk_update(payload)
+
+    # OpenAPI spec
+    @app.route("/openapi.json", methods=["GET"])
+    def openapi_json():
+        return jsonify(OPENAPI_SPEC), 200
+
+    # Swagger UI
+    @app.route("/docs", methods=["GET"])
+    def swagger_ui():
+        # Swagger UI HTML loading swagger-ui via CDN
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Geospatial Intelligence API Docs</title>
+            <link rel="stylesheet" type="text/css"
+              href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+        </head>
+        <body>
+        <div id="swagger-ui"></div>
+        <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+        <script>
+        window.onload = function() {
+          window.ui = SwaggerUIBundle({
+            url: '/openapi.json',
+            dom_id: '#swagger-ui'
+          });
+        };
+        </script>
+        </body>
+        </html>
+        """
+        return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
-# ---------------------------------------------------
-# Error handlers
-# ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# Handlers for observations
+# ---------------------------------------------------------------------------
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": "Endpoint not found", "code": 404}), 404
-
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({"error": "Internal server error", "code": 500}), 500
-
-
-@app.errorhandler(400)
-def bad_request(error):
-    return jsonify({"error": "Bad request", "code": 400}), 400
-
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-    return jsonify({
-        "error": "METHOD_NOT_ALLOWED",
-        "message": "The method is not allowed for the requested URL."
-    }), 405
-
-
-# ---------------------------------------------------
-# Basic routes
-# ---------------------------------------------------
-
-@app.route("/")
-def hello_world():
-    return jsonify({"message": "Hello World!"}), 200
-
-
-@app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({"status": "ok"}), 200
-
-
-# ---------------------------------------------------
-# Observations: CRUD + filtering + bulk
-# ---------------------------------------------------
-
-@app.route("/observations", methods=["GET"])
-def list_observations():
-    """
-    GET /observations
-    Supports:
-    - Geospatial filters: min_lat, max_lat, min_lon, max_lon
-    - Date range filters: start_date, end_date (based on Observation.timestamp)
-    - Generic field filters on data: e.g. country=UK, sensor=temperature
-    """
+def handle_observations_list():
+    # Filtering by date range and location via query params
     query = Observation.query
 
-    # --- Geospatial filters in SQL ---
-    min_lat = request.args.get("min_lat", type=float)
-    max_lat = request.args.get("max_lat", type=float)
-    min_lon = request.args.get("min_lon", type=float)
-    max_lon = request.args.get("max_lon", type=float)
+    start_ts_str = request.args.get("start_timestamp")
+    end_ts_str = request.args.get("end_timestamp")
+
+    try:
+        if start_ts_str:
+            start_ts = parse_iso8601(start_ts_str)
+            query = query.filter(Observation.timestamp >= start_ts)
+        if end_ts_str:
+            end_ts = parse_iso8601(end_ts_str)
+            query = query.filter(Observation.timestamp <= end_ts)
+    except ValueError as e:
+        return jsonify(
+            {"error": "VALIDATION_ERROR", "message": f"Invalid date filter: {e}"}
+        ), 400
+
+    # Location bounding box filter (min_lat, max_lat, min_lon, max_lon)
+    def parse_float_arg(name):
+        val = request.args.get(name)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except ValueError:
+            raise ValueError(f"Query param '{name}' must be a number.")
+
+    try:
+        min_lat = parse_float_arg("min_lat")
+        max_lat = parse_float_arg("max_lat")
+        min_lon = parse_float_arg("min_lon")
+        max_lon = parse_float_arg("max_lon")
+    except ValueError as e:
+        return jsonify(
+            {"error": "VALIDATION_ERROR", "message": str(e)}
+        ), 400
 
     if min_lat is not None:
         query = query.filter(Observation.latitude >= min_lat)
@@ -259,360 +439,1101 @@ def list_observations():
     if max_lon is not None:
         query = query.filter(Observation.longitude <= max_lon)
 
-    results = query.all()
-    filtered = results
+    observations = query.all()
+    return jsonify([observation_to_dict(o) for o in observations]), 200
 
-    # --- Date range filters based on Observation.timestamp ---
-    start_date_str = request.args.get("start_date")
-    end_date_str = request.args.get("end_date")
 
-    start_date, err = parse_date_param(start_date_str)
+def handle_observation_create():
+    if not request.is_json:
+        return jsonify(
+            {"error": "INVALID_PAYLOAD", "message": "Request body must be JSON."}
+        ), 400
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(
+            {
+                "error": "INVALID_PAYLOAD",
+                "message": "Request body must be a JSON object.",
+            }
+        ), 400
+
+    normalised, err = validate_observation_payload(payload, partial=False)
     if err:
-        return jsonify({"error": f"Invalid start_date format. {err}", "code": 400}), 400
-
-    end_date, err = parse_date_param(end_date_str)
-    if err:
-        return jsonify({"error": f"Invalid end_date format. {err}", "code": 400}), 400
-
-    if start_date or end_date:
-        date_filtered = []
-        for o in filtered:
-            obs_date = get_observation_date(o)
-            if obs_date is None:
-                continue
-            if start_date and obs_date < start_date:
-                continue
-            if end_date and obs_date > end_date:
-                continue
-            date_filtered.append(o)
-        filtered = date_filtered
-
-    # --- Generic filters on data + id ---
-    ignored_keys = {
-        "min_lat", "max_lat", "min_lon", "max_lon",
-        "start_date", "end_date"
-    }
-
-    for key, value in request.args.items():
-        if key in ignored_keys:
-            continue
-
-        if key == "id":
-            try:
-                wanted_id = int(value)
-            except ValueError:
-                continue
-            filtered = [o for o in filtered if o.id == wanted_id]
-        else:
-            new_filtered = []
-            for o in filtered:
-                data = o.data or {}
-                if str(data.get(key)) == value:
-                    new_filtered.append(o)
-            filtered = new_filtered
-
-    return jsonify([o.to_dict() for o in filtered]), 200
-
-
-@app.route("/observations", methods=["POST"])
-def create_observation():
-    """
-    POST /observations
-    - If body is a JSON object → create a single observation.
-    - If body is a JSON array  → bulk create.
-    """
-    payload = request.get_json()
-
-    # ---------- CASE 1: BULK (LIST) ----------
-    if isinstance(payload, list):
-        if not payload:
-            return jsonify({"error": "Request body is an empty list"}), 400
-
-        created = []
-        errors = []
-
-        for idx, item in enumerate(payload):
-            if not isinstance(item, dict):
-                errors.append({
-                    "index": idx,
-                    "error": "Item is not a JSON object"
-                })
-                continue
-
-            ok, msg = validate_geospatial(item)
-            if not ok:
-                errors.append({"index": idx, "error": msg})
-                continue
-
-            ts_str = item.get("timestamp")
-            obs_timestamp, err = parse_timestamp(ts_str)
-            if err:
-                errors.append({"index": idx, "error": err})
-                continue
-
-            obs = Observation(
-                latitude=item["latitude"],
-                longitude=item["longitude"],
-                data=item,
-                timestamp=obs_timestamp,
-            )
-            db.session.add(obs)
-            db.session.flush()
-            created.append(obs.to_dict())
-
-        if created:
-            db.session.commit()
-
-        if not created and errors:
-            return jsonify({
-                "message": "No records created",
-                "created": [],
-                "errors": errors
-            }), 400
-
-        if created and errors:
-            return jsonify({
-                "message": "Some records created, some failed",
-                "created": created,
-                "errors": errors
-            }), 207
-
-        return jsonify({
-            "message": "All records created successfully",
-            "created": created,
-            "errors": []
-        }), 201
-
-    # ---------- CASE 2: SINGLE OBJECT ----------
-    payload = payload or {}
-
-    ok, msg = validate_geospatial(payload)
-    if not ok:
-        return jsonify({"error": msg}), 400
-
-    ts_str = payload.get("timestamp")
-    obs_timestamp, err = parse_timestamp(ts_str)
-    if err:
-        return jsonify({"error": err}), 400
+        code, message = err
+        return jsonify({"error": code, "message": message}), 400
 
     obs = Observation(
-        latitude=payload["latitude"],
-        longitude=payload["longitude"],
-        data=payload,
-        timestamp=obs_timestamp,
+        timestamp=normalised["timestamp"],
+        timezone=normalised["timezone"],
+        latitude=normalised["latitude"],
+        longitude=normalised["longitude"],
+        satellite_id=normalised["satellite_id"],
+        spectral_indices=normalised.get("spectral_indices"),
+        notes=normalised.get("notes"),
     )
     db.session.add(obs)
     db.session.commit()
 
-    return jsonify(obs.to_dict()), 201
+    return jsonify(observation_to_dict(obs)), 201
 
 
-@app.route("/observations/<int:obs_id>", methods=["GET"])
-def get_observation(obs_id):
+def handle_observation_get(obs_id: int):
     obs = Observation.query.get(obs_id)
     if not obs:
-        return jsonify({"error": "Observation not found"}), 404
-    return jsonify(obs.to_dict()), 200
+        return jsonify({"error": "NOT_FOUND", "message": "Observation not found."}), 404
+    return jsonify(observation_to_dict(obs)), 200
 
 
-@app.route("/observations/<int:obs_id>", methods=["PUT"])
-def replace_observation(obs_id):
-    """
-    Full update (PUT) – record must be mutable and payload must be valid.
-    """
+def handle_observation_put(obs_id: int):
     obs = Observation.query.get(obs_id)
     if not obs:
-        return jsonify({"error": "Observation not found"}), 404
+        return jsonify({"error": "NOT_FOUND", "message": "Observation not found."}), 404
 
-    # Immutability check
-    if record_is_immutable(obs):
-        return jsonify({
-            "error": "IMMUTABLE_RECORD",
-            "message": "This observation was created before the current quarter and cannot be edited."
-        }), 403
+    if is_historical_record(obs):
+        return jsonify(
+            {
+                "error": "FORBIDDEN",
+                "message": "Cannot modify records before the current quarter.",
+            }
+        ), 403
 
-    payload = request.get_json() or {}
+    if not request.is_json:
+        return jsonify(
+            {"error": "INVALID_PAYLOAD", "message": "Request body must be JSON."}
+        ), 400
 
-    ok, msg = validate_geospatial(payload)
-    if not ok:
-        return jsonify({"error": msg}), 400
-
-    ts_str = payload.get("timestamp")
-    obs_timestamp, err = parse_timestamp(ts_str)
-    if err:
-        return jsonify({"error": err}), 400
-
-    obs.data = payload
-    obs.latitude = payload["latitude"]
-    obs.longitude = payload["longitude"]
-    obs.timestamp = obs_timestamp
-
-    db.session.commit()
-    return jsonify(obs.to_dict()), 200
-
-
-@app.route("/observations/<int:obs_id>", methods=["PATCH"])
-def patch_observation(obs_id):
-    """
-    Partial update (PATCH) for a single observation.
-    - Must send a JSON object (not a list).
-    - Record must be mutable (current quarter).
-    """
-    obs = Observation.query.get(obs_id)
-    if not obs:
-        return jsonify({"error": "Observation not found"}), 404
-
-    # Immutability check
-    if record_is_immutable(obs):
-        return jsonify({
-            "error": "IMMUTABLE_RECORD",
-            "message": "This observation was created before the current quarter and cannot be edited."
-        }), 403
-
-    payload = request.get_json()
-
-    # Guard against list / wrong type
+    payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
-        return jsonify({
-            "error": "INVALID_PAYLOAD",
-            "message": "Request body for /observations/<id> PATCH must be a JSON object. "
-                       "For bulk updates, use /observations/bulk with a JSON array."
-        }), 400
+        return jsonify(
+            {
+                "error": "INVALID_PAYLOAD",
+                "message": "Request body must be a JSON object.",
+            }
+        ), 400
 
-    if not isinstance(obs.data, dict):
-        obs.data = {}
+    normalised, err = validate_observation_payload(payload, partial=False)
+    if err:
+        code, message = err
+        return jsonify({"error": code, "message": message}), 400
 
-    merged = {**obs.data, **payload}
-
-    # Validate lat/lon if changed
-    if "latitude" in payload or "longitude" in payload:
-        ok, msg = validate_geospatial(merged)
-        if not ok:
-            return jsonify({"error": msg}), 400
-
-    # Handle timestamp if present
-    if "timestamp" in merged:
-        obs_timestamp, err = parse_timestamp(merged.get("timestamp"))
-        if err:
-            return jsonify({"error": err}), 400
-        obs.timestamp = obs_timestamp
-
-    obs.data = merged
-    # merged should always contain latitude/longitude from original or patch
-    obs.latitude = merged["latitude"]
-    obs.longitude = merged["longitude"]
+    obs.timestamp = normalised["timestamp"]
+    obs.timezone = normalised["timezone"]
+    obs.latitude = normalised["latitude"]
+    obs.longitude = normalised["longitude"]
+    obs.satellite_id = normalised["satellite_id"]
+    obs.spectral_indices = normalised.get("spectral_indices")
+    obs.notes = normalised.get("notes")
 
     db.session.commit()
-    return jsonify(obs.to_dict()), 200
+    return jsonify(observation_to_dict(obs)), 200
 
 
-@app.route("/observations/<int:obs_id>", methods=["DELETE"])
-def delete_observation(obs_id):
+def handle_observation_patch(obs_id: int):
     obs = Observation.query.get(obs_id)
     if not obs:
-        return jsonify({"error": "Observation not found"}), 404
+        return jsonify({"error": "NOT_FOUND", "message": "Observation not found."}), 404
+
+    if is_historical_record(obs):
+        return jsonify(
+            {
+                "error": "FORBIDDEN",
+                "message": "Cannot modify records before the current quarter.",
+            }
+        ), 403
+
+    if not request.is_json:
+        return jsonify(
+            {"error": "INVALID_PAYLOAD", "message": "Request body must be JSON."}
+        ), 400
+
+    payload = request.get_json(silent=True)
+
+    # Guard against client accidentally sending a list to PATCH single record
+    if isinstance(payload, list):
+        return jsonify(
+            {
+                "error": "INVALID_PAYLOAD",
+                "message": "Request body for /observations/<id> PATCH must be a JSON object. For bulk updates, use /observations/bulk with a JSON array.",
+            }
+        ), 400
+
+    if not isinstance(payload, dict):
+        return jsonify(
+            {
+                "error": "INVALID_PAYLOAD",
+                "message": "Request body must be a JSON object.",
+            }
+        ), 400
+
+    normalised, err = validate_observation_payload(payload, partial=True)
+    if err:
+        code, message = err
+        return jsonify({"error": code, "message": message}), 400
+
+    for key, value in normalised.items():
+        setattr(obs, key, value)
+
+    db.session.commit()
+    return jsonify(observation_to_dict(obs)), 200
+
+
+def handle_observation_delete(obs_id: int):
+    obs = Observation.query.get(obs_id)
+    if not obs:
+        return jsonify({"error": "NOT_FOUND", "message": "Observation not found."}), 404
+
+    if is_historical_record(obs):
+        return jsonify(
+            {
+                "error": "FORBIDDEN",
+                "message": "Cannot delete records before the current quarter.",
+            }
+        ), 403
 
     db.session.delete(obs)
     db.session.commit()
+    return jsonify({"message": "Observation deleted."}), 200
 
-    return jsonify({"message": "Observation deleted successfully"}), 200
+
+def handle_bulk_create(records: list):
+    created = []
+    errors = []
+
+    for idx, record in enumerate(records):
+        normalised, err = validate_observation_payload(record, partial=False)
+        if err:
+            code, message = err
+            errors.append(
+                {
+                    "index": idx,
+                    "error": code,
+                    "message": message,
+                }
+            )
+            continue
+
+        obs = Observation(
+            timestamp=normalised["timestamp"],
+            timezone=normalised["timezone"],
+            latitude=normalised["latitude"],
+            longitude=normalised["longitude"],
+            satellite_id=normalised["satellite_id"],
+            spectral_indices=normalised.get("spectral_indices"),
+            notes=normalised.get("notes"),
+        )
+        db.session.add(obs)
+        created.append(obs)
+
+    db.session.commit()
+
+    body = {
+        "created": [observation_to_dict(o) for o in created],
+        "errors": errors,
+    }
+
+    if errors:
+        # Partial failure
+        return jsonify(body), 207  # Multi-Status
+    else:
+        return jsonify(body), 201
 
 
-@app.route("/observations/bulk", methods=["PATCH"])
-def bulk_update_observations():
-    """
-    Bulk PATCH update.
-    Body: JSON array of objects with at least 'id' per item.
-    Applies immutability rules per record.
-    """
-    payload = request.get_json()
-
-    if not isinstance(payload, list) or not payload:
-        return jsonify({"error": "Request body must be a non-empty JSON array"}), 400
-
+def handle_bulk_update(records: list):
     updated = []
     errors = []
 
-    for idx, item in enumerate(payload):
-        if not isinstance(item, dict):
-            errors.append({"index": idx, "error": "Item is not a JSON object"})
+    for idx, record in enumerate(records):
+        if not isinstance(record, dict):
+            errors.append(
+                {
+                    "index": idx,
+                    "error": "INVALID_PAYLOAD",
+                    "message": "Each bulk update item must be a JSON object.",
+                }
+            )
             continue
 
-        obs_id = item.get("id")
+        obs_id = record.get("id")
         if obs_id is None:
-            errors.append({"index": idx, "error": "Missing 'id' field"})
+            errors.append(
+                {
+                    "index": idx,
+                    "error": "VALIDATION_ERROR",
+                    "message": "Missing 'id' for bulk update item.",
+                }
+            )
             continue
 
         obs = Observation.query.get(obs_id)
         if not obs:
-            errors.append({"index": idx, "error": f"Observation with id {obs_id} not found"})
+            errors.append(
+                {
+                    "index": idx,
+                    "error": "NOT_FOUND",
+                    "message": f"Observation with id={obs_id} not found.",
+                }
+            )
             continue
 
-        # Immutability check per record
-        if record_is_immutable(obs):
-            errors.append({
-                "index": idx,
-                "error": f"Observation with id {obs_id} is immutable (created before current quarter)"
-            })
+        if is_historical_record(obs):
+            errors.append(
+                {
+                    "index": idx,
+                    "error": "FORBIDDEN",
+                    "message": "Cannot modify records before the current quarter.",
+                }
+            )
             continue
 
-        if not isinstance(obs.data, dict):
-            obs.data = {}
+        # Remove id before validation
+        item_payload = dict(record)
+        item_payload.pop("id", None)
 
-        merged = {**obs.data, **item}
+        normalised, err = validate_observation_payload(item_payload, partial=True)
+        if err:
+            code, message = err
+            errors.append(
+                {
+                    "index": idx,
+                    "error": code,
+                    "message": message,
+                }
+            )
+            continue
 
-        # Validate geospatial if changed
-        if "latitude" in item or "longitude" in item:
-            ok, msg = validate_geospatial(merged)
-            if not ok:
-                errors.append({"index": idx, "error": msg})
-                continue
+        for key, value in normalised.items():
+            setattr(obs, key, value)
 
-        # Validate timestamp if changed
-        if "timestamp" in item:
-            obs_timestamp, err = parse_timestamp(merged.get("timestamp"))
-            if err:
-                errors.append({"index": idx, "error": err})
-                continue
-            obs.timestamp = obs_timestamp
+        updated.append(obs)
 
-        obs.data = merged
-        obs.latitude = merged["latitude"]
-        obs.longitude = merged["longitude"]
+    db.session.commit()
 
-        db.session.add(obs)
-        db.session.flush()
-        updated.append(obs.to_dict())
+    body = {
+        "updated": [observation_to_dict(o) for o in updated],
+        "errors": errors,
+    }
 
-    if updated:
-        db.session.commit()
-
-    if not updated and errors:
-        return jsonify({
-            "message": "No records updated",
-            "updated": [],
-            "errors": errors
-        }), 400
-
-    if updated and errors:
-        return jsonify({
-            "message": "Some records updated, some failed",
-            "updated": updated,
-            "errors": errors
-        }), 207
-
-    return jsonify({
-        "message": "All records updated successfully",
-        "updated": updated,
-        "errors": []
-    }), 200
+    if errors:
+        return jsonify(body), 207
+    else:
+        return jsonify(body), 200
 
 
-# ---------------------------------------------------
-# Entry point
-# ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# OpenAPI specification (minimal but valid)
+# ---------------------------------------------------------------------------
+
+# OPENAPI_SPEC = {
+#     "openapi": "3.0.0",
+#     "info": {
+#         "title": "Geospatial Intelligence API",
+#         "version": "1.0.0",
+#         "description": "Flask API for managing geospatial observations.",
+#     },
+#     "paths": {
+#         "/health": {
+#             "get": {
+#                 "summary": "Health check",
+#                 "responses": {
+#                     "200": {
+#                         "description": "API is healthy",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {
+#                                     "type": "object",
+#                                     "properties": {"status": {"type": "string"}},
+#                                 }
+#                             }
+#                         },
+#                     }
+#                 },
+#             }
+#         },
+#         "/auth/login": {
+#             "post": {
+#                 "summary": "Obtain JWT access token",
+#                 "requestBody": {
+#                     "required": True,
+#                     "content": {
+#                         "application/json": {
+#                             "schema": {
+#                                 "type": "object",
+#                                 "properties": {
+#                                     "username": {"type": "string"},
+#                                     "password": {"type": "string"},
+#                                 },
+#                                 "required": ["username", "password"],
+#                             }
+#                         }
+#                     },
+#                 },
+#                 "responses": {
+#                     "200": {
+#                         "description": "Login successful",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {
+#                                     "type": "object",
+#                                     "properties": {
+#                                         "access_token": {"type": "string"}
+#                                     },
+#                                 }
+#                             }
+#                         },
+#                     },
+#                     "401": {
+#                         "description": "Invalid credentials",
+#                         "content": {
+#                             "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+#                         },
+#                     },
+#                 },
+#             }
+#         },
+#         "/api/observations": {
+#             "get": {
+#                 "summary": "List observations",
+#                 "security": [{"bearerAuth": []}],
+#                 "parameters": [
+#                     {
+#                         "name": "start_timestamp",
+#                         "in": "query",
+#                         "schema": {"type": "string", "format": "date-time"},
+#                     },
+#                     {
+#                         "name": "end_timestamp",
+#                         "in": "query",
+#                         "schema": {"type": "string", "format": "date-time"},
+#                     },
+#                     {
+#                         "name": "min_lat",
+#                         "in": "query",
+#                         "schema": {"type": "number"},
+#                     },
+#                     {
+#                         "name": "max_lat",
+#                         "in": "query",
+#                         "schema": {"type": "number"},
+#                     },
+#                     {
+#                         "name": "min_lon",
+#                         "in": "query",
+#                         "schema": {"type": "number"},
+#                     },
+#                     {
+#                         "name": "max_lon",
+#                         "in": "query",
+#                         "schema": {"type": "number"},
+#                     },
+#                 ],
+#                 "responses": {
+#                     "200": {
+#                         "description": "List of observations",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {
+#                                     "type": "array",
+#                                     "items": {"$ref": "#/components/schemas/Observation"},
+#                                 }
+#                             }
+#                         },
+#                     }
+#                 },
+#             },
+#             "post": {
+#                 "summary": "Create observation",
+#                 "security": [{"bearerAuth": []}],
+#                 "requestBody": {
+#                     "required": True,
+#                     "content": {
+#                         "application/json": {
+#                             "schema": {"$ref": "#/components/schemas/ObservationCreate"}
+#                         }
+#                     },
+#                 },
+#                 "responses": {
+#                     "201": {
+#                         "description": "Created",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {"$ref": "#/components/schemas/Observation"}
+#                             }
+#                         },
+#                     },
+#                     "400": {
+#                         "description": "Validation error",
+#                         "content": {
+#                             "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+#                         },
+#                     },
+#                 },
+#             },
+#         },
+#         "/api/observations/bulk": {
+#             "post": {
+#                 "summary": "Bulk create observations",
+#                 "security": [{"bearerAuth": []}],
+#                 "requestBody": {
+#                     "required": True,
+#                     "content": {
+#                         "application/json": {
+#                             "schema": {
+#                                 "type": "array",
+#                                 "items": {"$ref": "#/components/schemas/ObservationCreate"},
+#                             }
+#                         }
+#                     },
+#                 },
+#                 "responses": {
+#                     "201": {
+#                         "description": "All records created successfully",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {"$ref": "#/components/schemas/BulkCreateResponse"}
+#                             }
+#                         },
+#                     },
+#                     "207": {
+#                         "description": "Partial success",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {"$ref": "#/components/schemas/BulkCreateResponse"}
+#                             }
+#                         },
+#                     },
+#                 },
+#             },
+#             "patch": {
+#                 "summary": "Bulk update observations",
+#                 "security": [{"bearerAuth": []}],
+#                 "requestBody": {
+#                     "required": True,
+#                     "content": {
+#                         "application/json": {
+#                             "schema": {
+#                                 "type": "array",
+#                                 "items": {
+#                                     "allOf": [
+#                                         {"$ref": "#/components/schemas/ObservationPatch"},
+#                                         {
+#                                             "type": "object",
+#                                             "properties": {"id": {"type": "integer"}},
+#                                             "required": ["id"],
+#                                         },
+#                                     ]
+#                                 },
+#                             }
+#                         }
+#                     },
+#                 },
+#                 "responses": {
+#                     "200": {
+#                         "description": "All updates applied",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {"$ref": "#/components/schemas/BulkUpdateResponse"}
+#                             }
+#                         },
+#                     },
+#                     "207": {
+#                         "description": "Partial success",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {"$ref": "#/components/schemas/BulkUpdateResponse"}
+#                             }
+#                         },
+#                     },
+#                 },
+#             },
+#         },
+#         "api/observations/{id}": {
+#             "get": {
+#                 "summary": "Get observation by id",
+#                 "security": [{"bearerAuth": []}],
+#                 "parameters": [
+#                     {
+#                         "name": "id",
+#                         "in": "path",
+#                         "required": True,
+#                         "schema": {"type": "integer"},
+#                     }
+#                 ],
+#                 "responses": {
+#                     "200": {
+#                         "description": "Observation",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {"$ref": "#/components/schemas/Observation"}
+#                             }
+#                         },
+#                     },
+#                     "404": {
+#                         "description": "Not found",
+#                         "content": {
+#                             "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+#                         },
+#                     },
+#                 },
+#             },
+#             "put": {
+#                 "summary": "Replace observation",
+#                 "security": [{"bearerAuth": []}],
+#                 "parameters": [
+#                     {
+#                         "name": "id",
+#                         "in": "path",
+#                         "required": True,
+#                         "schema": {"type": "integer"},
+#                     }
+#                 ],
+#                 "requestBody": {
+#                     "required": True,
+#                     "content": {
+#                         "application/json": {
+#                             "schema": {"$ref": "#/components/schemas/ObservationCreate"}
+#                         }
+#                     },
+#                 },
+#                 "responses": {
+#                     "200": {
+#                         "description": "Updated observation",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {"$ref": "#/components/schemas/Observation"}
+#                             }
+#                         },
+#                     },
+#                     "403": {
+#                         "description": "Historical record forbidden to edit",
+#                         "content": {
+#                             "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+#                         },
+#                     },
+#                 },
+#             },
+#             "patch": {
+#                 "summary": "Partially update observation",
+#                 "security": [{"bearerAuth": []}],
+#                 "parameters": [
+#                     {
+#                         "name": "id",
+#                         "in": "path",
+#                         "required": True,
+#                         "schema": {"type": "integer"},
+#                     }
+#                 ],
+#                 "requestBody": {
+#                     "required": True,
+#                     "content": {
+#                         "application/json": {
+#                             "schema": {"$ref": "#/components/schemas/ObservationPatch"}
+#                         }
+#                     },
+#                 },
+#                 "responses": {
+#                     "200": {
+#                         "description": "Updated observation",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {"$ref": "#/components/schemas/Observation"}
+#                             }
+#                         },
+#                     },
+#                     "403": {
+#                         "description": "Historical record forbidden to edit",
+#                         "content": {
+#                             "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+#                         },
+#                     },
+#                 },
+#             },
+#             "delete": {
+#                 "summary": "Delete observation",
+#                 "security": [{"bearerAuth": []}],
+#                 "parameters": [
+#                     {
+#                         "name": "id",
+#                         "in": "path",
+#                         "required": True,
+#                         "schema": {"type": "integer"},
+#                     }
+#                 ],
+#                 "responses": {
+#                     "200": {
+#                         "description": "Deleted",
+#                         "content": {
+#                             "application/json": {
+#                                 "schema": {
+#                                     "type": "object",
+#                                     "properties": {"message": {"type": "string"}},
+#                                 }
+#                             }
+#                         },
+#                     },
+#                     "403": {
+#                         "description": "Historical record forbidden to delete",
+#                         "content": {
+#                             "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+#                         },
+#                     },
+#                 },
+#             },
+#         },
+#     },
+#     "components": {
+#         "schemas": {
+#             "Observation": {
+#                 "type": "object",
+#                 "properties": {
+#                     "id": {"type": "integer"},
+#                     "timestamp": {"type": "string", "format": "date-time"},
+#                     "timezone": {"type": "string"},
+#                     "latitude": {"type": "number"},
+#                     "longitude": {"type": "number"},
+#                     "satellite_id": {"type": "string"},
+#                     "spectral_indices": {"type": "object"},
+#                     "notes": {"type": "string"},
+#                 },
+#                 "required": [
+#                     "id",
+#                     "timestamp",
+#                     "timezone",
+#                     "latitude",
+#                     "longitude",
+#                     "satellite_id",
+#                 ],
+#             },
+#             "ObservationCreate": {
+#                 "type": "object",
+#                 "properties": {
+#                     "timestamp": {"type": "string", "format": "date-time"},
+#                     "timezone": {"type": "string"},
+#                     "latitude": {"type": "number"},
+#                     "longitude": {"type": "number"},
+#                     "satellite_id": {"type": "string"},
+#                     "spectral_indices": {"type": "object"},
+#                     "notes": {"type": "string"},
+#                 },
+#                 "required": [
+#                     "timestamp",
+#                     "timezone",
+#                     "latitude",
+#                     "longitude",
+#                     "satellite_id",
+#                 ],
+#             },
+#             "ObservationPatch": {
+#                 "type": "object",
+#                 "properties": {
+#                     "timestamp": {"type": "string", "format": "date-time"},
+#                     "timezone": {"type": "string"},
+#                     "latitude": {"type": "number"},
+#                     "longitude": {"type": "number"},
+#                     "satellite_id": {"type": "string"},
+#                     "spectral_indices": {"type": "object"},
+#                     "notes": {"type": "string"},
+#                 },
+#             },
+#             "Error": {
+#                 "type": "object",
+#                 "properties": {
+#                     "error": {"type": "string"},
+#                     "message": {"type": "string"},
+#                 },
+#             },
+#             "BulkCreateResponse": {
+#                 "type": "object",
+#                 "properties": {
+#                     "created": {
+#                         "type": "array",
+#                         "items": {"$ref": "#/components/schemas/Observation"},
+#                     },
+#                     "errors": {
+#                         "type": "array",
+#                         "items": {"$ref": "#/components/schemas/BulkError"},
+#                     },
+#                 },
+#             },
+#             "BulkUpdateResponse": {
+#                 "type": "object",
+#                 "properties": {
+#                     "updated": {
+#                         "type": "array",
+#                         "items": {"$ref": "#/components/schemas/Observation"},
+#                     },
+#                     "errors": {
+#                         "type": "array",
+#                         "items": {"$ref": "#/components/schemas/BulkError"},
+#                     },
+#                 },
+#             },
+#             "BulkError": {
+#                 "type": "object",
+#                 "properties": {
+#                     "index": {"type": "integer"},
+#                     "error": {"type": "string"},
+#                     "message": {"type": "string"},
+#                 },
+#             },
+#         },
+#         "securitySchemes": {
+#             "bearerAuth": {
+#                 "type": "http",
+#                 "scheme": "bearer",
+#                 "bearerFormat": "JWT",
+#             }
+#         },
+#     },
+# }
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI specification (minimal but valid)
+# ---------------------------------------------------------------------------
+
+OPENAPI_SPEC = {
+    "openapi": "3.0.0",
+    "info": {
+        "title": "Geospatial Intelligence API",
+        "version": "1.0.0",
+        "description": "Flask API for managing geospatial observations.",
+    },
+    "paths": {
+        "/health": {
+            "get": {
+                "summary": "Health check",
+                "responses": {
+                    "200": {
+                        "description": "API is healthy",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"status": {"type": "string"}},
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/auth/login": {
+            "post": {
+                "summary": "Obtain JWT access token",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "username": {"type": "string"},
+                                    "password": {"type": "string"},
+                                },
+                                "required": ["username", "password"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "Login successful",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "access_token": {"type": "string"}
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "401": {
+                        "description": "Invalid credentials",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Error"}
+                            }
+                        },
+                    },
+                },
+            }
+        },
+        "/api/observations": {
+            "get": {
+                "summary": "List observations",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {
+                        "name": "start_timestamp",
+                        "in": "query",
+                        "schema": {"type": "string", "format": "date-time"},
+                    },
+                    {
+                        "name": "end_timestamp",
+                        "in": "query",
+                        "schema": {"type": "string", "format": "date-time"},
+                    },
+                    {
+                        "name": "min_lat",
+                        "in": "query",
+                        "schema": {"type": "number"},
+                    },
+                    {
+                        "name": "max_lat",
+                        "in": "query",
+                        "schema": {"type": "number"},
+                    },
+                    {
+                        "name": "min_lon",
+                        "in": "query",
+                        "schema": {"type": "number"},
+                    },
+                    {
+                        "name": "max_lon",
+                        "in": "query",
+                        "schema": {"type": "number"},
+                    },
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of observations",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "$ref": "#/components/schemas/Observation"
+                                    },
+                                }
+                            }
+                        },
+                    }
+                },
+            },
+            "post": {
+                "summary": "Create observation",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ObservationCreate"
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Observation"
+                                }
+                            }
+                        },
+                    },
+                    "400": {
+                        "description": "Validation error",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Error"}
+                            }
+                        },
+                    },
+                },
+            },
+        },
+        "/api/observations/bulk": {
+            "post": {
+                "summary": "Bulk create observations",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "array",
+                                "items": {
+                                    "$ref": "#/components/schemas/ObservationCreate"
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "201": {
+                        "description": "All records created successfully",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/BulkCreateResponse"
+                                }
+                            }
+                        },
+                    },
+                    "207": {
+                        "description": "Partial success",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/BulkCreateResponse"
+                                }
+                            }
+                        },
+                    },
+                },
+            }
+        },
+        "/api/observations/{id}": {
+            "get": {
+                "summary": "Get observation by id",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "integer"},
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Observation",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Observation"}
+                            }
+                        },
+                    },
+                    "404": {
+                        "description": "Not found",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Error"}
+                            }
+                        },
+                    },
+                },
+            }
+        },
+    },
+    "components": {
+        "schemas": {
+            "Observation": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "timestamp": {"type": "string", "format": "date-time"},
+                    "timezone": {"type": "string"},
+                    "latitude": {"type": "number"},
+                    "longitude": {"type": "number"},
+                    "satellite_id": {"type": "string"},
+                    "spectral_indices": {"type": "object"},
+                    "notes": {"type": "string"},
+                },
+                "required": [
+                    "id",
+                    "timestamp",
+                    "timezone",
+                    "latitude",
+                    "longitude",
+                    "satellite_id",
+                ],
+            },
+            "ObservationCreate": {
+                "type": "object",
+                "properties": {
+                    "timestamp": {"type": "string", "format": "date-time"},
+                    "timezone": {"type": "string"},
+                    "latitude": {"type": "number"},
+                    "longitude": {"type": "number"},
+                    "satellite_id": {"type": "string"},
+                    "spectral_indices": {"type": "object"},
+                    "notes": {"type": "string"},
+                },
+                "required": [
+                    "timestamp",
+                    "timezone",
+                    "latitude",
+                    "longitude",
+                    "satellite_id",
+                ],
+            },
+            "ObservationPatch": {
+                "type": "object",
+                "properties": {
+                    "timestamp": {"type": "string", "format": "date-time"},
+                    "timezone": {"type": "string"},
+                    "latitude": {"type": "number"},
+                    "longitude": {"type": "number"},
+                    "satellite_id": {"type": "string"},
+                    "spectral_indices": {"type": "object"},
+                    "notes": {"type": "string"},
+                },
+            },
+            "Error": {
+                "type": "object",
+                "properties": {
+                    "error": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            },
+            "BulkCreateResponse": {
+                "type": "object",
+                "properties": {
+                    "created": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/Observation"},
+                    },
+                    "errors": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/BulkError"},
+                    },
+                },
+            },
+            "BulkUpdateResponse": {
+                "type": "object",
+                "properties": {
+                    "updated": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/Observation"},
+                    },
+                    "errors": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/BulkError"},
+                    },
+                },
+            },
+            "BulkError": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "error": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            },
+        },
+        "securitySchemes": {
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT",
+            }
+        },
+    },
+}
+
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
+    app = create_app()
     app.run(debug=True)
