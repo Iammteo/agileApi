@@ -201,36 +201,6 @@ def jwt_required(fn):
         return fn(*args, **kwargs)
 
     return wrapper
-
-
-# ---------------------------------------------------------------------------
-# Application factory
-# ---------------------------------------------------------------------------
-
-def create_app():
-    app = Flask(__name__)
-
-    # Basic config
-    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
-        "DATABASE_URL", "sqlite:///observations.db"
-    )
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
-    app.config["PROPAGATE_EXCEPTIONS"] = True
-
-    db.init_app(app)
-
-    with app.app_context():
-        db.create_all()
-
-    register_error_handlers(app)
-    register_routes(app)
-
-    return app
-
-
-app = create_app()
-
 # ---------------------------------------------------------------------------
 # Error handlers (JSON only)
 # ---------------------------------------------------------------------------
@@ -271,8 +241,7 @@ def register_error_handlers(app: Flask):
         return jsonify(
             {"error": "INTERNAL_SERVER_ERROR", "message": "An unexpected error occurred."}
         ), 500
-
-
+        
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -387,6 +356,37 @@ def register_routes(app: Flask):
         </html>
         """
         return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
+
+def create_app():
+    app = Flask(__name__)
+
+    # Basic config
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
+        "DATABASE_URL", "sqlite:///observations.db"
+    )
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
+    app.config["PROPAGATE_EXCEPTIONS"] = True
+
+    db.init_app(app)
+
+    with app.app_context():
+        db.create_all()
+
+    register_error_handlers(app)
+    register_routes(app)
+
+    return app
+
+
+app = create_app()
+
+
+
 
 
 # ---------------------------------------------------------------------------
